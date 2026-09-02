@@ -1,0 +1,17 @@
+schema = 1
+
+[export]
+allow = [
+  ".github/workflows/public-ci.yml",
+  ".github/dependabot.yml",
+  "cmd",
+  "CONTRIBUTING.md",
+  "go.mod",
+  "go.sum",
+  "internal",
+  "LICENSE",
+  "README.md",
+  "release-manifest.toml",
+  "RELEASES",
+  "skills/brigsby",
+]

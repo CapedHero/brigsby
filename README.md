@@ -24,15 +24,19 @@ go run ./cmd/brigsby --help
 
 These commands require the Go version declared in [`go.mod`](go.mod).
 
-## Private development workspace
+## AI Caller Skill
 
-The primary development workspace is private
-[`CapedHero/brigsby-dev`](https://github.com/CapedHero/brigsby-dev). Its root
-AGENTS.md, CONTEXT.md, ADR index, research, and private Wayfinder board guide
-maintainers and AI contributors. The public
-[`CapedHero/brigsby`](https://github.com/CapedHero/brigsby) repository is a
-reviewed release and external-pull-request surface; it intentionally excludes
-those private development materials.
+The released first-party teaching Skill is
+[`skills/brigsby`](skills/brigsby/). Install that directory as the `brigsby`
+Skill using the supported skill-installation mechanism for the chosen Harness.
+An AI Caller can discover it from its model-facing description or invoke
+`$brigsby` explicitly. The Skill starts from the installed `brigsby --help`,
+then reads nested help before it uses a version-sensitive option.
+
+The Skill must stop for approval when the requested scope is ambiguous, a
+replacement or restore is required, or Brigsby reports a choice between
+preserving local content and restoring canonical content. The private
+development Skills and maintainer instructions are not part of a release.
 
 ## Contribution rule
 

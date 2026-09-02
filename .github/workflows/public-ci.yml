@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   verify:
+    if: github.repository == 'CapedHero/brigsby'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,6 +23,7 @@ jobs:
       - run: go build ./...
 
   codeql:
+    if: github.repository == 'CapedHero/brigsby'
     runs-on: ubuntu-latest
     permissions:
       contents: read

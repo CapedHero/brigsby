@@ -92,11 +92,13 @@ func validateAllowedPath(allowedPath string) error {
 		"docs/adr",
 		"docs/research",
 		"prototypes",
-		"skills",
 	} {
 		if allowedPath == privatePath || strings.HasPrefix(allowedPath, privatePath+"/") {
 			return fmt.Errorf("release manifest must not export private development path %q", allowedPath)
 		}
+	}
+	if strings.HasPrefix(allowedPath, "skills/") && allowedPath != "skills/brigsby" {
+		return fmt.Errorf("release manifest must not export private development path %q", allowedPath)
 	}
 	return nil
 }

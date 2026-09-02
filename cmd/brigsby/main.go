@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +14,14 @@ import (
 	"github.com/CapedHero/brigsby/internal/harness"
 	"github.com/CapedHero/brigsby/internal/portable"
 	"github.com/CapedHero/brigsby/internal/recovery"
+	"github.com/itchyny/gojq"
 	"github.com/spf13/cobra"
 )
 
-var errReportedProblems = errors.New("reported problems")
+var (
+	errReportedProblems = errors.New("reported problems")
+	errMachineInvalid   = errors.New("invalid machine output request")
+)
 
 const version = "dev"
 
@@ -26,21 +31,33 @@ func main() {
 
 func run(arguments []string, stdout, stderr io.Writer) int {
 	root := newRootCommand(stdout, stderr)
+	if hasOption(arguments, "--jq") && !hasOption(arguments, "--json") {
+		fmt.Fprintln(stderr, "--jq requires --json")
+		return 2
+	}
+	jsonRequested := hasOption(arguments, "--json")
+	var commandOutput bytes.Buffer
+	root.SetOut(&commandOutput)
 	root.SetArgs(arguments)
-	if err := root.Execute(); err != nil {
-		if errors.Is(err, errReportedProblems) {
+	err := root.Execute()
+	jsonFields, _ := root.PersistentFlags().GetString("json")
+	jqExpression, _ := root.PersistentFlags().GetString("jq")
+	if jsonRequested && jsonFields != "" {
+		result := machineResult(arguments, commandOutput.String(), err)
+		if outputErr := writeMachineResult(stdout, result, jsonFields, jqExpression); outputErr != nil {
 			return 1
 		}
-		if jsonFields, _ := root.PersistentFlags().GetString("json"); jsonFields != "" {
-			state := "invalid"
-			if strings.Contains(err.Error(), "BLOCKED:") {
-				state = "blocked"
-			}
-			_ = json.NewEncoder(stdout).Encode(map[string]any{
-				"command":  strings.Join(arguments, " "),
-				"state":    state,
-				"problems": []map[string]string{{"message": err.Error()}},
-			})
+		if err != nil {
+			return 1
+		}
+		if result["state"] == "planned" {
+			return 1
+		}
+		return 0
+	}
+	if err != nil {
+		if errors.Is(err, errReportedProblems) {
+			_, _ = io.Copy(stdout, &commandOutput)
 			return 1
 		}
 		fmt.Fprintln(stderr, err)
@@ -51,7 +68,154 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	_, _ = io.Copy(stdout, &commandOutput)
+	if outputState(commandOutput.String(), arguments, nil) == "planned" {
+		return 1
+	}
 	return 0
+}
+
+func hasOption(arguments []string, option string) bool {
+	for _, argument := range arguments {
+		if argument == option || strings.HasPrefix(argument, option+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func machineResult(arguments []string, output string, commandErr error) map[string]any {
+	result := map[string]any{
+		"command":  commandName(arguments),
+		"state":    outputState(output, arguments, commandErr),
+		"problems": []any{},
+	}
+	if json.Unmarshal([]byte(output), &result) == nil {
+		if _, found := result["problems"]; !found {
+			result["problems"] = []any{}
+		}
+		return result
+	}
+	if trimmed := strings.TrimSpace(output); trimmed != "" {
+		result["result"] = map[string]any{"output": trimmed}
+	}
+	if commandErr != nil {
+		result["problems"] = []map[string]string{{"message": commandErr.Error()}}
+	}
+	return result
+}
+
+func commandName(arguments []string) string {
+	if len(arguments) == 0 {
+		return "brigsby"
+	}
+	switch arguments[0] {
+	case "add":
+		return "artifact add"
+	case "status":
+		return "harness status"
+	case "sync":
+		return "harness sync"
+	}
+	command := []string{arguments[0]}
+	if len(arguments) > 1 && !strings.HasPrefix(arguments[1], "-") {
+		switch arguments[0] {
+		case "harness", "artifact", "namespace", "package", "recovery":
+			command = append(command, arguments[1])
+		}
+	}
+	return strings.Join(command, " ")
+}
+
+func outputState(output string, arguments []string, commandErr error) string {
+	if commandErr != nil {
+		if errors.Is(commandErr, errReportedProblems) || strings.Contains(commandErr.Error(), "BLOCKED:") {
+			return "blocked"
+		}
+		return "invalid"
+	}
+	if hasOption(arguments, "--dry-run") || strings.HasPrefix(strings.TrimSpace(output), "PLANNED ") {
+		return "planned"
+	}
+	if strings.HasPrefix(strings.TrimSpace(output), "CLEAN ") || commandName(arguments) == "version" {
+		return "clean"
+	}
+	return "applied"
+}
+
+func writeMachineResult(stdout io.Writer, result map[string]any, fields, jqExpression string) error {
+	selected, err := selectMachineFields(result, fields)
+	if err != nil {
+		if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
+			"command":  result["command"],
+			"state":    "invalid",
+			"problems": []map[string]string{{"message": err.Error()}},
+		}); encodeErr != nil {
+			return encodeErr
+		}
+		return errMachineInvalid
+	}
+	if jqExpression == "" {
+		return json.NewEncoder(stdout).Encode(selected)
+	}
+	query, err := gojq.Parse(jqExpression)
+	if err == nil {
+		var code *gojq.Code
+		code, err = gojq.Compile(query)
+		if err == nil {
+			iterator := code.Run(selected)
+			for {
+				value, ok := iterator.Next()
+				if !ok {
+					return nil
+				}
+				if valueErr, isError := value.(error); isError {
+					err = valueErr
+					break
+				}
+				if encodeErr := json.NewEncoder(stdout).Encode(value); encodeErr != nil {
+					return encodeErr
+				}
+			}
+		}
+	}
+	if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
+		"command":  result["command"],
+		"state":    "invalid",
+		"problems": []map[string]string{{"message": fmt.Sprintf("invalid --jq expression: %v", err)}},
+	}); encodeErr != nil {
+		return encodeErr
+	}
+	return errMachineInvalid
+}
+
+func selectMachineFields(result map[string]any, fields string) (map[string]any, error) {
+	selected := map[string]any{
+		"command":  result["command"],
+		"state":    result["state"],
+		"problems": result["problems"],
+	}
+	if fields == "all" {
+		for _, field := range []string{"result", "preview"} {
+			if value, found := result[field]; found {
+				selected[field] = value
+			}
+		}
+		return selected, nil
+	}
+	for _, field := range strings.Split(fields, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" || field == "command" || field == "state" || field == "problems" {
+			continue
+		}
+		if field != "result" && field != "preview" {
+			return nil, fmt.Errorf("unsupported --json field %q; use result, preview, or all", field)
+		}
+		if value, found := result[field]; found {
+			selected[field] = value
+		}
+	}
+	return selected, nil
 }
 
 func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
@@ -69,6 +233,7 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.SetErr(stderr)
 	root.SetVersionTemplate("brigsby {{.Version}}\n")
 	root.PersistentFlags().String("json", "", "emit provisional machine-readable JSON (for example, --json all)")
+	root.PersistentFlags().String("jq", "", "filter JSON output with a jq expression (requires --json)")
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print the development version",
@@ -83,7 +248,86 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newNamespaceCommand())
 	root.AddCommand(newPackageCommand())
 	root.AddCommand(newRecoveryCommand())
+	root.AddCommand(newAddRootAlias())
+	root.AddCommand(newStatusRootAlias())
+	root.AddCommand(newSyncRootAlias())
 	return root
+}
+
+func newRootAlias(name string, target []string, short string, configure func(*cobra.Command, *[]string)) *cobra.Command {
+	alias := &cobra.Command{
+		Use:   name,
+		Short: short,
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(command *cobra.Command, arguments []string) error {
+			aliased := newRootCommand(command.OutOrStdout(), command.ErrOrStderr())
+			aliasedArguments := append(append([]string{}, target...), arguments...)
+			if configure != nil {
+				configure(command, &aliasedArguments)
+			}
+			if jsonFields, _ := command.Root().PersistentFlags().GetString("json"); jsonFields != "" {
+				aliasedArguments = append(aliasedArguments, "--json", jsonFields)
+			}
+			aliased.SetArgs(aliasedArguments)
+			return aliased.Execute()
+		},
+	}
+	return alias
+}
+
+func newAddRootAlias() *cobra.Command {
+	var namespace, name, kind string
+	alias := newRootAlias("add", []string{"artifact", "add"}, "Capture a local Artifact as an immutable canonical revision.", func(command *cobra.Command, arguments *[]string) {
+		for _, flag := range []struct{ name, value string }{{"namespace", namespace}, {"name", name}, {"kind", kind}} {
+			if command.Flags().Changed(flag.name) {
+				*arguments = append(*arguments, "--"+flag.name, flag.value)
+			}
+		}
+	})
+	alias.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
+	alias.Flags().StringVar(&name, "name", "", "canonical Artifact name")
+	alias.Flags().StringVar(&kind, "kind", "skills", "Artifact kind: skills or instructions")
+	return alias
+}
+
+func newStatusRootAlias() *cobra.Command {
+	var harnessID string
+	alias := newRootAlias("status", []string{"harness", "status"}, "Report linked Harness state.", func(command *cobra.Command, arguments *[]string) {
+		if command.Flags().Changed("harness") {
+			*arguments = append(*arguments, "--harness", harnessID)
+		}
+	})
+	alias.Flags().StringVar(&harnessID, "harness", "", "filter by linked Harness installation ID")
+	return alias
+}
+
+func newSyncRootAlias() *cobra.Command {
+	var harnessIDs, selectors []string
+	var expect string
+	var force, dryRun bool
+	alias := newRootAlias("sync", []string{"harness", "sync"}, "Safely project selected canonical Skills to linked Harnesses.", func(command *cobra.Command, arguments *[]string) {
+		for _, value := range harnessIDs {
+			*arguments = append(*arguments, "--harness", value)
+		}
+		for _, value := range selectors {
+			*arguments = append(*arguments, "--artifact", value)
+		}
+		if force {
+			*arguments = append(*arguments, "--force")
+		}
+		if command.Flags().Changed("expect") {
+			*arguments = append(*arguments, "--expect", expect)
+		}
+		if dryRun {
+			*arguments = append(*arguments, "--dry-run")
+		}
+	})
+	alias.Flags().StringSliceVar(&harnessIDs, "harness", nil, "linked Harness installation ID (repeatable)")
+	alias.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Skill selector (repeatable)")
+	alias.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
+	alias.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
+	alias.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return alias
 }
 
 func newPackageCommand() *cobra.Command {

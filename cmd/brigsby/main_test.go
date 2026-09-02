@@ -178,8 +178,8 @@ func TestRecoveryRestoreDryRunDoesNotWrite(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"recovery", "restore", id[1], "--dry-run"}, &stdout, &stderr); got != 0 {
-		t.Fatalf("dry-run exit code = %d; stderr = %s", got, stderr.String())
+	if got := run([]string{"recovery", "restore", id[1], "--dry-run"}, &stdout, &stderr); got != 1 {
+		t.Fatalf("dry-run exit code = %d, want 1; stderr = %s", got, stderr.String())
 	}
 	if output := stdout.String(); !strings.Contains(output, "PLANNED") || !strings.Contains(output, id[1]) {
 		t.Fatalf("dry-run output = %q, want planned restore", output)
@@ -357,6 +357,188 @@ func TestCLIHelp(t *testing.T) {
 	}
 }
 
+func TestRootAddAliasCapturesAnArtifact(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatalf("write Skill fixture: %v", err)
+	}
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"add", source}, &stdout, &stderr); got != 0 {
+		t.Fatalf("root add exit code = %d; stderr = %s", got, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "CAPTURED main/skills/release-notes sha256-") {
+		t.Fatalf("root add output = %q, want captured Artifact", stdout.String())
+	}
+}
+
+func TestRootAddAliasUsesTheCanonicalMachineCommand(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatalf("write Skill fixture: %v", err)
+	}
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"add", source, "--json", "all"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("root add exit code = %d; stderr = %s", got, stderr.String())
+	}
+	var result struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("parse root add JSON = %v; output = %s", err, stdout.String())
+	}
+	if result.Command != "artifact add" {
+		t.Fatalf("root add command = %q, want canonical artifact add", result.Command)
+	}
+}
+
+func TestRootStatusAndSyncAliasesPreserveHarnessBehavior(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("create Harness fixture: %v", err)
+	}
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatalf("write Skill fixture: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	for _, arguments := range [][]string{{"harness", "link", "codex-personal"}, {"add", source}} {
+		var setupOut, setupErr bytes.Buffer
+		if got := run(arguments, &setupOut, &setupErr); got != 0 {
+			t.Fatalf("setup %v exit code = %d; stderr = %s", arguments, got, setupErr.String())
+		}
+	}
+
+	var statusOut, statusErr bytes.Buffer
+	if got := run([]string{"status", "--harness", "codex-personal"}, &statusOut, &statusErr); got != 0 {
+		t.Fatalf("root status exit code = %d; stderr = %s", got, statusErr.String())
+	}
+	if !strings.Contains(statusOut.String(), "LINKED codex-personal") {
+		t.Fatalf("root status output = %q, want linked Harness", statusOut.String())
+	}
+
+	var syncOut, syncErr bytes.Buffer
+	if got := run([]string{"sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run"}, &syncOut, &syncErr); got != 1 {
+		t.Fatalf("root sync dry-run exit code = %d, want 1; stderr = %s", got, syncErr.String())
+	}
+	if !strings.Contains(syncOut.String(), "PLANNED main/skills/release-notes") {
+		t.Fatalf("root sync output = %q, want planned projection", syncOut.String())
+	}
+}
+
+func TestCLIJSONEnvelopeSupportsSuccessDryRunBlockedResultAndJQ(t *testing.T) {
+	t.Run("success and jq", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if got := run([]string{"version", "--json", "all", "--jq", ".state"}, &stdout, &stderr); got != 0 {
+			t.Fatalf("version exit code = %d; stderr = %s", got, stderr.String())
+		}
+		if got, want := strings.TrimSpace(stdout.String()), "\"clean\""; got != want {
+			t.Fatalf("jq result = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("dry run", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if got := run([]string{"namespace", "set-prefix", "main", "mw-", "--dry-run", "--json", "all"}, &stdout, &stderr); got != 1 {
+			t.Fatalf("dry-run exit code = %d, want 1; stderr = %s", got, stderr.String())
+		}
+		var result struct {
+			Command  string `json:"command"`
+			State    string `json:"state"`
+			Problems []any  `json:"problems"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("parse dry-run JSON = %v; output = %s", err, stdout.String())
+		}
+		if result.Command != "namespace set-prefix" || result.State != "planned" || len(result.Problems) != 0 {
+			t.Fatalf("dry-run JSON = %#v", result)
+		}
+	})
+
+	t.Run("blocked result", func(t *testing.T) {
+		home := t.TempDir()
+		skills := filepath.Join(home, ".agents", "skills", "release-notes")
+		source := filepath.Join(home, "release-notes")
+		for path, contents := range map[string]string{
+			filepath.Join(skills, "SKILL.md"): "# Local copy\n",
+			filepath.Join(source, "SKILL.md"): "# Canonical copy\n",
+		} {
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("create fixture directory: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+		}
+		t.Setenv("HOME", home)
+		t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+		for _, arguments := range [][]string{{"harness", "link", "codex-personal"}, {"artifact", "add", source}} {
+			var setupOut, setupErr bytes.Buffer
+			if got := run(arguments, &setupOut, &setupErr); got != 0 {
+				t.Fatalf("setup %v exit code = %d; stderr = %s", arguments, got, setupErr.String())
+			}
+		}
+		var stdout, stderr bytes.Buffer
+		if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--json", "all"}, &stdout, &stderr); got != 1 {
+			t.Fatalf("blocked exit code = %d, want 1; stderr = %s", got, stderr.String())
+		}
+		var result struct {
+			State    string `json:"state"`
+			Problems []struct {
+				Message string `json:"message"`
+			} `json:"problems"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("parse blocked JSON = %v; output = %s", err, stdout.String())
+		}
+		if result.State != "blocked" || len(result.Problems) != 1 || !strings.Contains(result.Problems[0].Message, "Unowned path") {
+			t.Fatalf("blocked JSON = %#v", result)
+		}
+	})
+}
+
+func TestCLIRejectsJQWithoutJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"version", "--jq", ".state"}, &stdout, &stderr); got != 2 {
+		t.Fatalf("exit code = %d, want 2", got)
+	}
+	if !strings.Contains(stderr.String(), "--jq requires --json") {
+		t.Fatalf("error output = %q, want explicit JSON requirement", stderr.String())
+	}
+}
+
+func TestCLIReportsInvalidJSONFilterAsMachineProblem(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"version", "--json", "all", "--jq", "["}, &stdout, &stderr); got != 1 {
+		t.Fatalf("exit code = %d, want 1", got)
+	}
+	var result struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("parse JSON = %v; output = %s", err, stdout.String())
+	}
+	if result.State != "invalid" {
+		t.Fatalf("JSON result = %#v, want invalid state", result)
+	}
+}
+
 func TestHarnessDiscoverFindsCodexUserSkillsInTemporaryHome(t *testing.T) {
 	home := t.TempDir()
 	skills := filepath.Join(home, ".agents", "skills")
@@ -464,8 +646,8 @@ func TestHarnessUnlinkDryRunDoesNotWrite(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "unlink", "codex-personal", "--dry-run"}, &stdout, &stderr); got != 0 {
-		t.Fatalf("dry-run exit code = %d; stderr = %s", got, stderr.String())
+	if got := run([]string{"harness", "unlink", "codex-personal", "--dry-run"}, &stdout, &stderr); got != 1 {
+		t.Fatalf("dry-run exit code = %d, want 1; stderr = %s", got, stderr.String())
 	}
 	if output := stdout.String(); !strings.Contains(output, "PLANNED unlink codex-personal") {
 		t.Fatalf("dry-run output = %q, want planned unlink", output)
@@ -1153,8 +1335,8 @@ func TestArtifactSelectDryRunDoesNotChangeSelection(t *testing.T) {
 	second := regexp.MustCompile(`sha256-[0-9a-f]+`).FindString(secondOut.String())
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"artifact", "select", "main/skills/release-notes", "--revision", first, "--dry-run"}, &stdout, &stderr); got != 0 {
-		t.Fatalf("dry-run exit code = %d; stderr = %s", got, stderr.String())
+	if got := run([]string{"artifact", "select", "main/skills/release-notes", "--revision", first, "--dry-run"}, &stdout, &stderr); got != 1 {
+		t.Fatalf("dry-run exit code = %d, want 1; stderr = %s", got, stderr.String())
 	}
 	if output := stdout.String(); !strings.Contains(output, "PLANNED select main/skills/release-notes "+first) {
 		t.Fatalf("dry-run output = %q, want planned select", output)
@@ -1646,8 +1828,8 @@ func TestHarnessSyncReportsAProvisionalJSONPlan(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run", "--json", "all"}, &stdout, &stderr); got != 0 {
-		t.Fatalf("sync exit code = %d; stderr = %s", got, stderr.String())
+	if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run", "--json", "all"}, &stdout, &stderr); got != 1 {
+		t.Fatalf("sync exit code = %d, want 1; stderr = %s", got, stderr.String())
 	}
 	var result struct {
 		Command string `json:"command"`
