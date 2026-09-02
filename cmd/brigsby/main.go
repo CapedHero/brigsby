@@ -277,7 +277,7 @@ func newRootAlias(name string, target []string, short string, configure func(*co
 
 func newAddRootAlias() *cobra.Command {
 	var namespace, name, kind string
-	alias := newRootAlias("add", []string{"artifact", "add"}, "Capture a local Artifact as an immutable canonical revision.", func(command *cobra.Command, arguments *[]string) {
+	alias := newRootAlias("add", []string{"artifact", "add"}, "Capture one or more local Artifacts as immutable canonical revisions.", func(command *cobra.Command, arguments *[]string) {
 		for _, flag := range []struct{ name, value string }{{"namespace", namespace}, {"name", name}, {"kind", kind}} {
 			if command.Flags().Changed(flag.name) {
 				*arguments = append(*arguments, "--"+flag.name, flag.value)
@@ -303,7 +303,6 @@ func newStatusRootAlias() *cobra.Command {
 
 func newSyncRootAlias() *cobra.Command {
 	var harnessIDs, selectors []string
-	var expect string
 	var force, dryRun bool
 	alias := newRootAlias("sync", []string{"harness", "sync"}, "Safely project selected canonical Skills to linked Harnesses.", func(command *cobra.Command, arguments *[]string) {
 		for _, value := range harnessIDs {
@@ -315,17 +314,13 @@ func newSyncRootAlias() *cobra.Command {
 		if force {
 			*arguments = append(*arguments, "--force")
 		}
-		if command.Flags().Changed("expect") {
-			*arguments = append(*arguments, "--expect", expect)
-		}
 		if dryRun {
 			*arguments = append(*arguments, "--dry-run")
 		}
 	})
 	alias.Flags().StringSliceVar(&harnessIDs, "harness", nil, "linked Harness installation ID (repeatable)")
 	alias.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Skill selector (repeatable)")
-	alias.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
-	alias.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
+	alias.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
 	alias.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
 	return alias
 }
@@ -544,34 +539,41 @@ func newArtifactCommand() *cobra.Command {
 	}
 	var namespace, name, kind string
 	add := &cobra.Command{
-		Use:   "add <path>",
-		Short: "Capture a local Artifact as an immutable canonical revision.",
-		Args:  cobra.ExactArgs(1),
+		Use:   "add <path>...",
+		Short: "Capture one or more local Artifacts as immutable canonical revisions.",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if kind != "skills" && kind != "instructions" {
 				return fmt.Errorf("unsupported Artifact kind %q", kind)
+			}
+			if command.Flags().Changed("name") && len(arguments) > 1 {
+				return fmt.Errorf("--name cannot be combined with multiple paths; the canonical name is derived from each path")
 			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
 			store := artifact.NewStore(root)
-			options := artifact.CaptureOptions{Namespace: namespace, Name: name, ExplicitName: command.Flags().Changed("name")}
-			var revision artifact.Revision
-			if kind == "instructions" {
-				revision, err = store.CaptureInstructions(arguments[0], options)
-			} else {
-				revision, err = store.CaptureSkill(arguments[0], options)
+			for _, path := range arguments {
+				options := artifact.CaptureOptions{Namespace: namespace, Name: name, ExplicitName: command.Flags().Changed("name")}
+				var revision artifact.Revision
+				if kind == "instructions" {
+					revision, err = store.CaptureInstructions(path, options)
+				} else {
+					revision, err = store.CaptureSkill(path, options)
+				}
+				if err != nil {
+					return fmt.Errorf("capture Artifact %s: %w", path, err)
+				}
+				if _, err := fmt.Fprintf(command.OutOrStdout(), "CAPTURED %s %s\n", revision.Selector, revision.Digest); err != nil {
+					return err
+				}
 			}
-			if err != nil {
-				return fmt.Errorf("capture Artifact: %w", err)
-			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "CAPTURED %s %s\n", revision.Selector, revision.Digest)
-			return err
+			return nil
 		},
 	}
 	add.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
-	add.Flags().StringVar(&name, "name", "", "canonical Artifact name")
+	add.Flags().StringVar(&name, "name", "", "canonical Artifact name (single path only)")
 	add.Flags().StringVar(&kind, "kind", "skills", "Artifact kind: skills or instructions")
 	artifactCommand.AddCommand(add)
 	var listNamespace, listKind string
@@ -705,7 +707,7 @@ func newHarnessCommand() *cobra.Command {
 		Short: "Discover supported user-level Harness installations.",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverPersonalCandidates()
+			candidates, err := discoverBuiltinCandidates()
 			if err != nil {
 				return err
 			}
@@ -735,7 +737,7 @@ func newHarnessCommand() *cobra.Command {
 		Short: "Link a discovered Harness installation.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverPersonalCandidates()
+			candidates, err := discoverBuiltinCandidates()
 			if err != nil {
 				return err
 			}
@@ -925,7 +927,6 @@ func newHarnessCommand() *cobra.Command {
 	status.Flags().StringVar(&statusHarness, "harness", "", "filter by linked Harness installation ID")
 	harnessCommand.AddCommand(status)
 	var linkedIDs, selectors []string
-	var expect string
 	var force, dryRun bool
 	sync := &cobra.Command{
 		Use:   "sync",
@@ -941,7 +942,7 @@ func newHarnessCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("read linked Harnesses: %w", err)
 			}
-			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force, expect)
+			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force)
 			if err != nil {
 				return err
 			}
@@ -982,8 +983,7 @@ func newHarnessCommand() *cobra.Command {
 	}
 	sync.Flags().StringSliceVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
 	sync.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Skill selector (repeatable)")
-	sync.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
-	sync.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
+	sync.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
 	sync.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
 	harnessCommand.AddCommand(sync)
 	return harnessCommand
@@ -998,7 +998,7 @@ type syncTarget struct {
 	removal  bool
 }
 
-func preflightSync(root string, registry harness.Registry, linked []harness.Candidate, requestedHarnesses, requestedArtifacts []string, force bool, expect string) (targets []syncTarget, err error) {
+func preflightSync(root string, registry harness.Registry, linked []harness.Candidate, requestedHarnesses, requestedArtifacts []string, force bool) (targets []syncTarget, err error) {
 	success := false
 	var cleanups []func()
 	defer func() {
@@ -1046,7 +1046,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 				return nil, fmt.Errorf("read selected Artifact: %w", err)
 			}
 			var instructionTargets []syncTarget
-			var changed []string
+			changed := false
 			for _, targetHarness := range selectedHarnesses {
 				rendered, err := store.RenderSelectedInstructions(selector, targetHarness.Name)
 				if err != nil {
@@ -1068,16 +1068,13 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 						return nil, fmt.Errorf("plan Instruction Projection: %w", err)
 					}
 					if plan.TargetFingerprint() != "absent" && plan.TargetFingerprint() != plan.ReplacementFingerprint() {
-						changed = append(changed, plan.TargetFingerprint())
+						changed = true
 					}
 					instructionTargets = append(instructionTargets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: item.target, plan: plan, cleanup: rendered.Cleanup})
 				}
 			}
-			if len(changed) > 0 {
-				expected := strings.Join(changed, ",")
-				if len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 || !force || expect != expected {
-					return nil, fmt.Errorf("BLOCKED: Instruction Projection differs from %s; rerun with --force --expect %s", renderedInstructionPaths(instructionTargets), expected)
-				}
+			if changed && (len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 || !force) {
+				return nil, fmt.Errorf("BLOCKED: Instruction Projection differs from %s; narrow --harness and --artifact to one target and rerun with --force", renderedInstructionPaths(instructionTargets))
 			}
 			targets = append(targets, instructionTargets...)
 			continue
@@ -1110,10 +1107,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 							break
 						}
 					}
-					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby artifact add %s' or rerun with --force --expect %s", kind, target, rendered.Revision.Selector, target, plan.TargetFingerprint())
-				}
-				if expect != plan.TargetFingerprint() {
-					return nil, fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", plan.TargetFingerprint())
+					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby artifact add %s' or rerun with --force", kind, target, rendered.Revision.Selector, target)
 				}
 			}
 			targets = append(targets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: target, plan: plan, cleanup: rendered.Cleanup})
@@ -1288,7 +1282,7 @@ type discoveredCandidate struct {
 	found     bool
 }
 
-func discoverPersonalCandidates() ([]discoveredCandidate, error) {
+func discoverBuiltinCandidates() ([]discoveredCandidate, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("find user home: %w", err)
@@ -1300,9 +1294,9 @@ func discoverPersonalCandidates() ([]discoveredCandidate, error) {
 		return nil, fmt.Errorf("XDG_CONFIG_HOME must be an absolute path")
 	}
 	known := []harness.Candidate{
-		{ID: "codex-personal", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: filepath.Join(home, ".codex")},
-		{ID: "claude-personal", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: filepath.Join(home, ".claude")},
-		{ID: "opencode-personal", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: filepath.Join(configHome, "opencode")},
+		{ID: "codex", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: filepath.Join(home, ".codex")},
+		{ID: "claude", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: filepath.Join(home, ".claude")},
+		{ID: "opencode", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: filepath.Join(configHome, "opencode")},
 	}
 	discovered := make([]discoveredCandidate, 0, len(known))
 	for _, candidate := range known {
