@@ -31,10 +31,12 @@ var (
 // -ldflags "-X main.version=<tag>" (the Homebrew formula does this).
 var version = "dev"
 
-// pseudoVersionTail matches the trailing "-<14-digit timestamp>-<12-hex>" of a
+// pseudoVersionTail matches the trailing "<14-digit timestamp>-<12-hex>" of a
 // Go module pseudo-version, which VCS stamping writes into Main.Version for an
-// ordinary `go build` from a checkout.
-var pseudoVersionTail = regexp.MustCompile(`-[0-9]{14}-[0-9a-f]{12}$`)
+// ordinary `go build` from a checkout. The timestamp is preceded by "-" when no
+// tag is reachable (v0.0.0-20060102150405-abcdef012345) and by "." when one is
+// (v1.2.3-0.20060102150405-abcdef012345), so match the signature itself.
+var pseudoVersionTail = regexp.MustCompile(`[0-9]{14}-[0-9a-f]{12}$`)
 
 // pickVersion resolves the reported version from the two inputs that can carry
 // a release identity: the linker-injected package variable (set by the
