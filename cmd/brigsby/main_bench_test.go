@@ -43,7 +43,7 @@ func BenchmarkHarnessSyncDryRun(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run"}, &stdout, &stderr); code != 1 {
+		if code := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
 			b.Fatalf("dry-run failed with %d: %s", code, stderr.String())
 		}
 	}
@@ -74,7 +74,7 @@ func BenchmarkRootSyncDryRunJSON(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run", "--json", "all"}, &stdout, &stderr); code != 1 {
+		if code := run([]string{"sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run", "--json", "all"}, &stdout, &stderr); code != 0 {
 			b.Fatalf("JSON dry-run failed with %d: %s", code, stderr.String())
 		}
 	}

@@ -69,8 +69,7 @@ then reads nested help before it uses a version-sensitive option.
 
 The Skill must stop for approval when the requested scope is ambiguous, a
 replacement or restore is required, or Brigsby reports a choice between
-preserving local content and restoring canonical content. The private
-development Skills and maintainer instructions are not part of a release.
+preserving local content and restoring canonical content.
 
 ## Contribution rule
 

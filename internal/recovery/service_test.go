@@ -30,6 +30,43 @@ func TestPlanDoesNotWriteFilesOrRecoveryState(t *testing.T) {
 	}
 }
 
+func TestContentFingerprintIgnoresPermissionsButFingerprintDoesNot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	first := writeFile(t, root, "first/SKILL.md", "same text\n")
+	second := writeFile(t, root, "second/SKILL.md", "same text\n")
+	if err := os.Chmod(filepath.Dir(first), 0o700); err != nil {
+		t.Fatalf("chmod first directory: %v", err)
+	}
+	if err := os.Chmod(first, 0o600); err != nil {
+		t.Fatalf("chmod first file: %v", err)
+	}
+
+	firstContent, err := recovery.ContentFingerprint(filepath.Dir(first))
+	if err != nil {
+		t.Fatalf("first content fingerprint: %v", err)
+	}
+	secondContent, err := recovery.ContentFingerprint(filepath.Dir(second))
+	if err != nil {
+		t.Fatalf("second content fingerprint: %v", err)
+	}
+	if firstContent != secondContent {
+		t.Fatalf("content fingerprints differ for equal text: %s != %s", firstContent, secondContent)
+	}
+	firstExact, err := recovery.Fingerprint(filepath.Dir(first))
+	if err != nil {
+		t.Fatalf("first exact fingerprint: %v", err)
+	}
+	secondExact, err := recovery.Fingerprint(filepath.Dir(second))
+	if err != nil {
+		t.Fatalf("second exact fingerprint: %v", err)
+	}
+	if firstExact == secondExact {
+		t.Fatal("exact recovery fingerprints unexpectedly ignore permissions")
+	}
+}
+
 func TestApplyStoresPreimageBeforeReplacingTarget(t *testing.T) {
 	t.Parallel()
 

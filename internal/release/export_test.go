@@ -99,6 +99,26 @@ func TestReleaseManifestStagesTheFirstPartyTeachingSkill(t *testing.T) {
 			t.Errorf("staged release file %q is unavailable: %v", pathname, err)
 		}
 	}
+	readme, err := os.ReadFile(filepath.Join(destination, "README.md"))
+	if err != nil {
+		t.Fatalf("read staged public README: %v", err)
+	}
+	publicREADME := strings.Join(strings.Fields(string(readme)), " ")
+	for _, phrase := range []string{"## AI Caller Skill", "skills/brigsby", "$brigsby"} {
+		if !strings.Contains(publicREADME, phrase) {
+			t.Errorf("staged public README does not contain %q", phrase)
+		}
+	}
+	for _, phrase := range []string{
+		"CapedHero/brigsby-dev",
+		"private development Skills",
+		"Private development workspace",
+		"private-development navigation",
+	} {
+		if strings.Contains(publicREADME, phrase) {
+			t.Errorf("staged public README leaks private-workspace guidance %q", phrase)
+		}
+	}
 }
 
 func contains(values []string, expected string) bool {
