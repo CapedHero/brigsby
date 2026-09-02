@@ -848,6 +848,55 @@ func TestPackageCreateAndInspectSelectedSkill(t *testing.T) {
 		if !strings.Contains(stdout.String(), "PACKAGE") {
 			t.Fatalf("%v output = %q, want package result", arguments, stdout.String())
 		}
+		if arguments[1] == "inspect" && !strings.Contains(stdout.String(), "ARTIFACT main/skills/release-notes") {
+			t.Fatalf("inspect output = %q, want included Artifact selector", stdout.String())
+		}
+	}
+}
+
+func TestCLIActionableDomainErrorsDoNotPrintUsage(t *testing.T) {
+	for _, arguments := range [][]string{
+		{"package", "create", "main/skills/release-notes"},
+		{"artifact", "promote", "friend/skills/release-notes"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if got := run(arguments, &stdout, &stderr); got != 3 {
+			t.Fatalf("%v exit code = %d, want 3; stderr=%q", arguments, got, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "Usage:") {
+			t.Fatalf("%v stderr = %q, want concise domain error", arguments, stderr.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"--json", "all", "artifact", "promote", "friend/skills/release-notes"}, &stdout, &stderr); got != 3 {
+		t.Fatalf("JSON domain error exit code = %d, want 3; stderr=%q", got, stderr.String())
+	}
+	var result struct {
+		Problems []struct {
+			Code string `json:"code"`
+		} `json:"problems"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || len(result.Problems) != 1 || result.Problems[0].Code != "domain_error" {
+		t.Fatalf("JSON domain error = %q err=%v, want domain_error", stdout.String(), err)
+	}
+}
+
+func TestHarnessStatusExplainsNoLinkedHarnesses(t *testing.T) {
+	t.Setenv("BRIGSBY_HOME", filepath.Join(t.TempDir(), ".brigsby"))
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"harness", "status"}, &stdout, &stderr); got != 0 || stdout.String() != "No linked Harnesses.\n" {
+		t.Fatalf("status exit=%d stdout=%q stderr=%q", got, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"harness", "status", "--json", "all"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("JSON status exit=%d stderr=%q", got, stderr.String())
+	}
+	var result struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.State != "clean" {
+		t.Fatalf("JSON status = %q err=%v, want clean", stdout.String(), err)
 	}
 }
 
@@ -1477,7 +1526,7 @@ func TestHarnessStatusReportsUnownedLocalSkill(t *testing.T) {
 	}
 }
 
-func TestHarnessStatusReportsDriftWhenSelectedRevisionChanges(t *testing.T) {
+func TestHarnessStatusReportsStaleProjectionWhenSelectedRevisionChanges(t *testing.T) {
 	home := t.TempDir()
 	skills := filepath.Join(home, ".agents", "skills")
 	source := filepath.Join(home, "release-notes")
@@ -1514,8 +1563,114 @@ func TestHarnessStatusReportsDriftWhenSelectedRevisionChanges(t *testing.T) {
 	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
-	if output := stdout.String(); !strings.Contains(output, "DRIFT main/skills/release-notes") {
-		t.Fatalf("status output = %q, want Drift after selected Revision changed", output)
+	if output := stdout.String(); !strings.Contains(output, "STALE main/skills/release-notes") {
+		t.Fatalf("status output = %q, want stale Projection after selected Revision changed", output)
+	}
+}
+
+func TestHarnessSyncFastForwardsPristineStaleProjectionWithRecovery(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# First revision\n"), 0o644); err != nil {
+		t.Fatalf("write first Skill revision: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("create Codex fixture: %v", err)
+	}
+	for _, arguments := range [][]string{
+		{"harness", "link", "codex-personal"},
+		{"artifact", "add", source},
+		{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if got := run(arguments, &stdout, &stderr); got != 0 {
+			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Second revision\n"), 0o644); err != nil {
+		t.Fatalf("write second Skill revision: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"artifact", "add", source, "--name", "release-notes"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("recapture exit code = %d; stderr = %s", got, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run"}, &stdout, &stderr); got != 0 || !strings.Contains(stdout.String(), "PLANNED") {
+		t.Fatalf("fast-forward dry-run exit=%d stdout=%q stderr=%q", got, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("fast-forward sync exit=%d stderr=%q", got, stderr.String())
+	}
+	id := regexp.MustCompile(`recovery=([0-9]+-[0-9a-f]{32})`).FindStringSubmatch(stdout.String())
+	if len(id) != 2 {
+		t.Fatalf("fast-forward output = %q, want Recovery ID", stdout.String())
+	}
+	contents, err := os.ReadFile(filepath.Join(skills, "release-notes", "SKILL.md"))
+	if err != nil || string(contents) != "# Second revision\n" {
+		t.Fatalf("fast-forward Projection = %q, err=%v", contents, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"recovery", "restore", id[1]}, &stdout, &stderr); got != 0 {
+		t.Fatalf("restore fast-forward preimage exit=%d stderr=%q", got, stderr.String())
+	}
+	contents, err = os.ReadFile(filepath.Join(skills, "release-notes", "SKILL.md"))
+	if err != nil || string(contents) != "# First revision\n" {
+		t.Fatalf("restored preimage = %q, err=%v", contents, err)
+	}
+}
+
+func TestHarnessSyncBlocksEditedStaleProjection(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# First revision\n"), 0o644); err != nil {
+		t.Fatalf("write first Skill revision: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("create Codex fixture: %v", err)
+	}
+	for _, arguments := range [][]string{
+		{"harness", "link", "codex-personal"},
+		{"artifact", "add", source},
+		{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if got := run(arguments, &stdout, &stderr); got != 0 {
+			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
+		}
+	}
+	if err := os.WriteFile(filepath.Join(skills, "release-notes", "SKILL.md"), []byte("# Local edit\n"), 0o644); err != nil {
+		t.Fatalf("edit Projection: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Second revision\n"), 0o644); err != nil {
+		t.Fatalf("write second Skill revision: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"artifact", "add", source, "--name", "release-notes"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("recapture exit code = %d; stderr = %s", got, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes"}, &stdout, &stderr); got != 3 {
+		t.Fatalf("edited stale sync exit=%d stderr=%q", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "BLOCKED: Drift") || strings.Contains(stderr.String(), "Usage:") {
+		t.Fatalf("edited stale sync stderr=%q, want concise drift block", stderr.String())
 	}
 }
 
@@ -2033,7 +2188,7 @@ func TestCLIUsabilityFixesForSafeObservationAndExistingSkills(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"artifact", "add", "--kind", "instructions", filepath.Join(home, ".codex")}, &stdout, &stderr); got != 2 || !strings.Contains(stderr.String(), "structured Instruction set") {
+	if got := run([]string{"artifact", "add", "--kind", "instructions", filepath.Join(home, ".codex")}, &stdout, &stderr); got != 3 || !strings.Contains(stderr.String(), "structured Instruction set") || strings.Contains(stderr.String(), "Usage:") {
 		t.Fatalf("unstructured instruction source exit=%d stderr=%q", got, stderr.String())
 	}
 }
