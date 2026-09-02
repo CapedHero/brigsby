@@ -901,7 +901,7 @@ func readInstructions(source string) ([]member, instructionSourceManifest, error
 	}
 	manifestContents, found := byPath["instructions.toml"]
 	if !found {
-		return nil, instructionSourceManifest{}, fmt.Errorf("Instruction source requires instructions.toml")
+		return nil, instructionSourceManifest{}, fmt.Errorf("Instruction source requires instructions.toml; expected a structured Instruction set with AGENTS.md and declared Instruction docs")
 	}
 	var manifest instructionSourceManifest
 	decoder := toml.NewDecoder(bytes.NewReader(manifestContents))

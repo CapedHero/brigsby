@@ -714,6 +714,91 @@ func fingerprintFile(path string) (string, error) {
 	return fmt.Sprintf("sha256-%x", hash.Sum(nil)), nil
 }
 
+// ContentFingerprint identifies the text tree Brigsby projects, intentionally
+// excluding permission bits. Recovery.Fingerprint remains mode-sensitive for
+// recovery preconditions and exact preimage restoration; this separate value
+// answers the user-facing question of whether a Skill's content drifted.
+func ContentFingerprint(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return absentFingerprint, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("symlink is not supported: %s", path)
+	}
+	if info.Mode().IsRegular() {
+		return contentFingerprintFile(path)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("unsupported filesystem entry: %s", path)
+	}
+	return contentFingerprintTree(path)
+}
+
+func contentFingerprintFile(path string) (string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	if err := writeRecord(hash, []byte("brigsby-content-file-v1"), contents); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sha256-%x", hash.Sum(nil)), nil
+}
+
+func contentFingerprintTree(root string) (string, error) {
+	type member struct {
+		relative  string
+		directory bool
+	}
+	var members []member
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 || (!entry.IsDir() && !entry.Type().IsRegular()) {
+			return fmt.Errorf("unsupported filesystem entry: %s", path)
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		members = append(members, member{filepath.ToSlash(relative), entry.IsDir()})
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].relative < members[j].relative })
+	hash := sha256.New()
+	if err := writeRecord(hash, []byte("brigsby-content-tree-v1")); err != nil {
+		return "", err
+	}
+	for _, member := range members {
+		kind := []byte("file")
+		contents := []byte(nil)
+		if member.directory {
+			kind = []byte("directory")
+		} else {
+			var err error
+			contents, err = os.ReadFile(filepath.Join(root, filepath.FromSlash(member.relative)))
+			if err != nil {
+				return "", err
+			}
+		}
+		if err := writeRecord(hash, kind, []byte(member.relative), contents); err != nil {
+			return "", err
+		}
+	}
+	return fmt.Sprintf("sha256-%x", hash.Sum(nil)), nil
+}
+
 func fingerprintTree(root string) (string, error) {
 	type member struct {
 		relative  string

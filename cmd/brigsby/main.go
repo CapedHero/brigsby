@@ -58,7 +58,10 @@ func pickVersion(ldflag, biVersion string, biOK bool) string {
 // isReleaseVersion reports whether v came from installing a published tag
 // rather than from a local build tree.
 func isReleaseVersion(v string) bool {
-	v, _, _ = strings.Cut(v, "+") // drop "+dirty" / "+incompatible" build metadata
+	if strings.HasSuffix(v, "+dirty") {
+		return false
+	}
+	v, _, _ = strings.Cut(v, "+") // drop "+incompatible" build metadata
 	if v == "" || v == "(devel)" {
 		return false
 	}
@@ -98,9 +101,9 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		if err != nil {
-			return 1
-		}
-		if result["state"] == "planned" {
+			if isBlockedError(err) {
+				return 3
+			}
 			return 1
 		}
 		return 0
@@ -108,7 +111,11 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		if errors.Is(err, errReportedProblems) {
 			_, _ = io.Copy(stdout, &commandOutput)
-			return 1
+			return 0
+		}
+		if isBlockedError(err) {
+			fmt.Fprintln(stderr, err)
+			return 3
 		}
 		fmt.Fprintln(stderr, err)
 		fmt.Fprintln(stderr)
@@ -119,10 +126,11 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	_, _ = io.Copy(stdout, &commandOutput)
-	if outputState(commandOutput.String(), arguments, nil) == "planned" {
-		return 1
-	}
 	return 0
+}
+
+func isBlockedError(err error) bool {
+	return err != nil && (errors.Is(err, errReportedProblems) || strings.Contains(err.Error(), "BLOCKED:"))
 }
 
 func hasOption(arguments []string, option string) bool {
@@ -150,12 +158,17 @@ func machineResult(arguments []string, output string, commandErr error) map[stri
 		result["result"] = map[string]any{"output": trimmed}
 	}
 	if commandErr != nil {
-		result["problems"] = []map[string]string{{"message": commandErr.Error()}}
+		code := "invalid_request"
+		if isBlockedError(commandErr) {
+			code = "blocked"
+		}
+		result["problems"] = []map[string]string{{"code": code, "message": commandErr.Error()}}
 	}
 	return result
 }
 
 func commandName(arguments []string) string {
+	arguments = commandArguments(arguments)
 	if len(arguments) == 0 {
 		return "brigsby"
 	}
@@ -177,9 +190,28 @@ func commandName(arguments []string) string {
 	return strings.Join(command, " ")
 }
 
+func commandArguments(arguments []string) []string {
+	for len(arguments) > 0 {
+		argument := arguments[0]
+		if argument == "--json" || argument == "--jq" {
+			if len(arguments) < 2 {
+				return nil
+			}
+			arguments = arguments[2:]
+			continue
+		}
+		if strings.HasPrefix(argument, "--json=") || strings.HasPrefix(argument, "--jq=") {
+			arguments = arguments[1:]
+			continue
+		}
+		break
+	}
+	return arguments
+}
+
 func outputState(output string, arguments []string, commandErr error) string {
 	if commandErr != nil {
-		if errors.Is(commandErr, errReportedProblems) || strings.Contains(commandErr.Error(), "BLOCKED:") {
+		if isBlockedError(commandErr) {
 			return "blocked"
 		}
 		return "invalid"
@@ -199,7 +231,7 @@ func writeMachineResult(stdout io.Writer, result map[string]any, fields, jqExpre
 		if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
 			"command":  result["command"],
 			"state":    "invalid",
-			"problems": []map[string]string{{"message": err.Error()}},
+			"problems": []map[string]string{{"code": "invalid_request", "message": err.Error()}},
 		}); encodeErr != nil {
 			return encodeErr
 		}
@@ -232,7 +264,7 @@ func writeMachineResult(stdout io.Writer, result map[string]any, fields, jqExpre
 	if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
 		"command":  result["command"],
 		"state":    "invalid",
-		"problems": []map[string]string{{"message": fmt.Sprintf("invalid --jq expression: %v", err)}},
+		"problems": []map[string]string{{"code": "invalid_request", "message": fmt.Sprintf("invalid --jq expression: %v", err)}},
 	}); encodeErr != nil {
 		return encodeErr
 	}
@@ -327,7 +359,7 @@ func newRootAlias(name string, target []string, short string, configure func(*co
 
 func newAddRootAlias() *cobra.Command {
 	var namespace, name, kind string
-	alias := newRootAlias("add", []string{"artifact", "add"}, "Capture a local Artifact as an immutable canonical revision.", func(command *cobra.Command, arguments *[]string) {
+	alias := newRootAlias("add <path>", []string{"artifact", "add"}, "Capture a local Artifact directory as an immutable canonical revision.", func(command *cobra.Command, arguments *[]string) {
 		for _, flag := range []struct{ name, value string }{{"namespace", namespace}, {"name", name}, {"kind", kind}} {
 			if command.Flags().Changed(flag.name) {
 				*arguments = append(*arguments, "--"+flag.name, flag.value)
@@ -381,7 +413,7 @@ func newSyncRootAlias() *cobra.Command {
 }
 
 func newPackageCommand() *cobra.Command {
-	packageCommand := &cobra.Command{Use: "package", Short: "Create and inspect portable text-only Packages."}
+	packageCommand := &cobra.Command{Use: "package", Short: "Create and inspect portable text-only Packages.", Long: "Create and inspect portable text-only Packages. Artifact selectors use namespace/kind/name, for example main/skills/release-notes."}
 	var output, expect string
 	var replace bool
 	create := &cobra.Command{
@@ -591,6 +623,7 @@ func newArtifactCommand() *cobra.Command {
 	artifactCommand := &cobra.Command{
 		Use:   "artifact",
 		Short: "Capture and inspect canonical Artifacts.",
+		Long:  "Capture and inspect canonical Artifacts. An Artifact selector is namespace/kind/name, for example main/skills/release-notes.",
 	}
 	var namespace, name, kind string
 	add := &cobra.Command{
@@ -652,8 +685,9 @@ func newArtifactCommand() *cobra.Command {
 	var selectRevision string
 	var selectDryRun bool
 	selectCommand := &cobra.Command{
-		Use:   "select <namespace/skills/name>",
-		Short: "Select an already stored Skill Revision.",
+		Use:   "select <namespace/kind/name>",
+		Short: "Select an already stored Artifact Revision.",
+		Long:  "Select an already stored Artifact Revision. The selector is namespace/kind/name, for example main/skills/release-notes.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if selectRevision == "" {
@@ -686,7 +720,7 @@ func newArtifactCommand() *cobra.Command {
 	var promoteRevision string
 	var promoteDryRun bool
 	promote := &cobra.Command{
-		Use: "promote <namespace/skills/name>", Short: "Promote one imported Skill Revision to main.", Args: cobra.ExactArgs(1),
+		Use: "promote <namespace/kind/name>", Short: "Promote one imported Artifact Revision to main.", Long: "Promote one imported Artifact Revision to main. The selector is namespace/kind/name, for example friend/skills/release-notes.", Args: cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if promoteRevision == "" {
 				return fmt.Errorf("promote requires --revision sha256-<hex>")
@@ -715,9 +749,11 @@ func newArtifactCommand() *cobra.Command {
 	promote.Flags().StringVar(&promoteRevision, "revision", "", "imported Revision digest")
 	promote.Flags().BoolVar(&promoteDryRun, "dry-run", false, "preview without writing")
 	artifactCommand.AddCommand(promote)
-	artifactCommand.AddCommand(&cobra.Command{
-		Use:   "show <namespace/skills/name>",
-		Short: "Show the selected revision of a canonical Skill.",
+	var showFiles bool
+	show := &cobra.Command{
+		Use:   "show <namespace/kind/name>",
+		Short: "Show metadata for the selected canonical Artifact revision.",
+		Long:  "Show metadata for the selected canonical Artifact revision. Pass --files to print the selected canonical text files.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			root, err := brigsbyHome()
@@ -734,14 +770,46 @@ func newArtifactCommand() *cobra.Command {
 				return fmt.Errorf("show Artifact origin: %w", err)
 			}
 			if origin.Selector != "" {
-				_, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s origin=%s@%s\n", revision.Selector, revision.Digest, origin.Selector, origin.Revision)
+				if _, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s origin=%s@%s\n", revision.Selector, revision.Digest, origin.Selector, origin.Revision); err != nil {
+					return err
+				}
+			} else if _, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s\n", revision.Selector, revision.Digest); err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s\n", revision.Selector, revision.Digest)
-			return err
+			if !showFiles {
+				return nil
+			}
+			_, filesPath, err := store.SelectedFilesPath(arguments[0])
+			if err != nil {
+				return fmt.Errorf("show Artifact files: %w", err)
+			}
+			return writeArtifactFiles(command.OutOrStdout(), filesPath)
 		},
-	})
+	}
+	show.Flags().BoolVar(&showFiles, "files", false, "print selected canonical text files")
+	artifactCommand.AddCommand(show)
 	return artifactCommand
+}
+
+func writeArtifactFiles(output io.Writer, root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(output, "FILE %s bytes=%d\n%s\n---\n", filepath.ToSlash(relative), len(contents), contents)
+		return err
+	})
 }
 
 func newHarnessCommand() *cobra.Command {
@@ -908,7 +976,7 @@ func newHarnessCommand() *cobra.Command {
 						continue
 					}
 					owned[projection.Path] = struct{}{}
-					current, err := recovery.Fingerprint(projection.Path)
+					matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
 					if err != nil {
 						return fmt.Errorf("fingerprint Projection: %w", err)
 					}
@@ -916,7 +984,7 @@ func newHarnessCommand() *cobra.Command {
 					if err != nil && !os.IsNotExist(err) {
 						return fmt.Errorf("read selected Artifact: %w", err)
 					}
-					if err == nil && current == projection.Fingerprint && selected.Digest == projection.Revision {
+					if err == nil && matches && selected.Digest == projection.Revision {
 						if err := write("PROJECTION %s %s %s\n", projection.Artifact, projection.Revision, projection.Path); err != nil {
 							return err
 						}
@@ -966,9 +1034,6 @@ func newHarnessCommand() *cobra.Command {
 					return err
 				}
 			}
-			if driftCount > 0 || unownedCount > 0 {
-				return errReportedProblems
-			}
 			return nil
 		},
 	}
@@ -978,9 +1043,10 @@ func newHarnessCommand() *cobra.Command {
 	var expect string
 	var force, dryRun bool
 	sync := &cobra.Command{
-		Use:   "sync",
+		Use:   "sync [artifact-selector...]",
 		Short: "Safely project selected canonical Skills to linked Harnesses.",
-		Args:  cobra.NoArgs,
+		Long:  "Safely project selected canonical Skills to linked Harnesses. Artifact selectors use namespace/kind/name, for example main/skills/release-notes.",
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
 			root, err := brigsbyHome()
 			if err != nil {
@@ -991,6 +1057,7 @@ func newHarnessCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("read linked Harnesses: %w", err)
 			}
+			selectors = append(selectors, arguments...)
 			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force, expect)
 			if err != nil {
 				return err
@@ -1012,15 +1079,18 @@ func newHarnessCommand() *cobra.Command {
 					}
 					continue
 				}
-				if target.plan.TargetFingerprint() == target.plan.ReplacementFingerprint() {
-					continue
+				if target.plan.TargetFingerprint() != target.plan.ReplacementFingerprint() {
+					operation, err := recovery.New(root).Apply(target.plan)
+					if err != nil {
+						return partialSyncError(operations, target, err)
+					}
+					operations = append(operations, operation)
 				}
-				operation, err := recovery.New(root).Apply(target.plan)
+				contentFingerprint, err := recovery.ContentFingerprint(target.path)
 				if err != nil {
-					return partialSyncError(operations, target, err)
+					return partialSyncError(operations, target, fmt.Errorf("fingerprint projected content: %w", err))
 				}
-				operations = append(operations, operation)
-				if err := registry.RecordProjection(harness.Projection{HarnessID: target.harness.ID, Path: target.path, Artifact: target.revision.Selector, Revision: target.revision.Digest, Fingerprint: target.plan.ReplacementFingerprint()}); err != nil {
+				if err := registry.RecordProjection(harness.Projection{HarnessID: target.harness.ID, Path: target.path, Artifact: target.revision.Selector, Revision: target.revision.Digest, Fingerprint: contentFingerprint}); err != nil {
 					return partialSyncError(operations, target, fmt.Errorf("record Projection: %w", err))
 				}
 			}
@@ -1031,7 +1101,7 @@ func newHarnessCommand() *cobra.Command {
 		},
 	}
 	sync.Flags().StringSliceVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
-	sync.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Skill selector (repeatable)")
+	sync.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Artifact selector (repeatable; positional selectors are also accepted)")
 	sync.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
 	sync.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
 	sync.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
@@ -1117,7 +1187,15 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 					if err != nil {
 						return nil, fmt.Errorf("plan Instruction Projection: %w", err)
 					}
-					if plan.TargetFingerprint() != "absent" && plan.TargetFingerprint() != plan.ReplacementFingerprint() {
+					targetContent, err := recovery.ContentFingerprint(item.target)
+					if err != nil {
+						return nil, fmt.Errorf("fingerprint Instruction Projection content: %w", err)
+					}
+					replacementContent, err := recovery.ContentFingerprint(item.source)
+					if err != nil {
+						return nil, fmt.Errorf("fingerprint rendered Instruction content: %w", err)
+					}
+					if targetContent != "absent" && targetContent != replacementContent {
 						changed = append(changed, plan.TargetFingerprint())
 					}
 					instructionTargets = append(instructionTargets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: item.target, plan: plan, cleanup: rendered.Cleanup})
@@ -1148,7 +1226,15 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 			if err != nil {
 				return nil, fmt.Errorf("plan projection: %w", err)
 			}
-			if plan.TargetFingerprint() != "absent" && plan.TargetFingerprint() != plan.ReplacementFingerprint() {
+			targetContent, err := recovery.ContentFingerprint(target)
+			if err != nil {
+				return nil, fmt.Errorf("fingerprint projection content: %w", err)
+			}
+			replacementContent, err := recovery.ContentFingerprint(rendered.FilesPath)
+			if err != nil {
+				return nil, fmt.Errorf("fingerprint rendered Skill content: %w", err)
+			}
+			if targetContent != "absent" && targetContent != replacementContent {
 				if len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 {
 					return nil, fmt.Errorf("BLOCKED: %s differs from %s; narrow --harness and --artifact to one target before force sync", target, rendered.Revision.Selector)
 				}
@@ -1171,11 +1257,11 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 				if projection.HarnessID != targetHarness.ID || projection.Artifact != rendered.Revision.Selector || projection.Path == target {
 					continue
 				}
-				current, err := recovery.Fingerprint(projection.Path)
+				matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
 				if err != nil {
 					return nil, fmt.Errorf("fingerprint previous Projection: %w", err)
 				}
-				if current != projection.Fingerprint {
+				if !matches {
 					return nil, fmt.Errorf("BLOCKED: previous Projection %s drifted; resolve it before migrating to %s", projection.Path, target)
 				}
 				removalPlan, err := recovery.PlanRemoval(projection.Path)
@@ -1190,6 +1276,25 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 	return targets, nil
 }
 
+// projectionFingerprintMatches accepts the current content fingerprint and the
+// legacy exact recovery fingerprint already persisted by earlier Brigsby
+// versions. The comparison is explicit: a legacy value remains an exact
+// comparison rather than being reinterpreted as content-only state.
+func projectionFingerprintMatches(path, expected string) (bool, error) {
+	content, err := recovery.ContentFingerprint(path)
+	if err != nil {
+		return false, err
+	}
+	if content == expected {
+		return true, nil
+	}
+	exact, err := recovery.Fingerprint(path)
+	if err != nil {
+		return false, err
+	}
+	return exact == expected, nil
+}
+
 func renderedInstructionPaths(targets []syncTarget) string {
 	paths := make([]string, len(targets))
 	for index, target := range targets {
@@ -1200,7 +1305,7 @@ func renderedInstructionPaths(targets []syncTarget) string {
 
 func instructionRootPath(candidate harness.Candidate) (string, error) {
 	if !filepath.IsAbs(candidate.InstructionsPath) {
-		return "", fmt.Errorf("linked Harness %q has no instruction location; unlink and relink it", candidate.ID)
+		return "", fmt.Errorf("linked Harness %q has no structured Instruction location; create instructions.toml beside its native instruction root, then unlink and relink it", candidate.ID)
 	}
 	if candidate.Name == "claude" {
 		return filepath.Join(candidate.InstructionsPath, "CLAUDE.md"), nil
@@ -1350,9 +1455,9 @@ func discoverPersonalCandidates() ([]discoveredCandidate, error) {
 		return nil, fmt.Errorf("XDG_CONFIG_HOME must be an absolute path")
 	}
 	known := []harness.Candidate{
-		{ID: "codex-personal", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: filepath.Join(home, ".codex")},
-		{ID: "claude-personal", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: filepath.Join(home, ".claude")},
-		{ID: "opencode-personal", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: filepath.Join(configHome, "opencode")},
+		{ID: "codex-personal", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".codex"))},
+		{ID: "claude-personal", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".claude"))},
+		{ID: "opencode-personal", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(configHome, "opencode"))},
 	}
 	discovered := make([]discoveredCandidate, 0, len(known))
 	for _, candidate := range known {
@@ -1370,6 +1475,14 @@ func discoverPersonalCandidates() ([]discoveredCandidate, error) {
 		discovered = append(discovered, discoveredCandidate{candidate: candidate, found: true})
 	}
 	return discovered, nil
+}
+
+func structuredInstructionPath(path string) string {
+	info, err := os.Stat(filepath.Join(path, "instructions.toml"))
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	return path
 }
 
 func brigsbyHome() (string, error) {
