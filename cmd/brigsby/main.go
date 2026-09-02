@@ -8,7 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 
 	"github.com/CapedHero/brigsby/internal/artifact"
 	"github.com/CapedHero/brigsby/internal/harness"
@@ -23,7 +26,52 @@ var (
 	errMachineInvalid   = errors.New("invalid machine output request")
 )
 
-const version = "dev"
+// version is the release identity. It stays "dev" for an ordinary `go build`
+// or `go run` from a checkout and is overridden at release build time with
+// -ldflags "-X main.version=<tag>" (the Homebrew formula does this).
+var version = "dev"
+
+// pseudoVersionTail matches the trailing "-<14-digit timestamp>-<12-hex>" of a
+// Go module pseudo-version, which VCS stamping writes into Main.Version for an
+// ordinary `go build` from a checkout.
+var pseudoVersionTail = regexp.MustCompile(`-[0-9]{14}-[0-9a-f]{12}$`)
+
+// pickVersion resolves the reported version from the two inputs that can carry
+// a release identity: the linker-injected package variable (set by the
+// Homebrew formula and any other tagged build), and the module version
+// recorded by `go install <module>@<tag>` (biVersion/biOK from
+// debug.ReadBuildInfo). Anything that is not a clean release tag -- "(devel)"
+// from `go run`, the empty string, or a commit pseudo-version from a local
+// `go build` -- falls back to "dev".
+func pickVersion(ldflag, biVersion string, biOK bool) string {
+	if ldflag != "dev" {
+		return ldflag
+	}
+	if biOK && isReleaseVersion(biVersion) {
+		return biVersion
+	}
+	return "dev"
+}
+
+// isReleaseVersion reports whether v came from installing a published tag
+// rather than from a local build tree.
+func isReleaseVersion(v string) bool {
+	v, _, _ = strings.Cut(v, "+") // drop "+dirty" / "+incompatible" build metadata
+	if v == "" || v == "(devel)" {
+		return false
+	}
+	return !pseudoVersionTail.MatchString(v)
+}
+
+// resolveVersion is memoized: newRootCommand runs once per alias invocation and
+// on the benchmarked help path, so the debug.ReadBuildInfo read must not repeat.
+var resolveVersion = sync.OnceValue(func() string {
+	biVersion, biOK := "", false
+	if info, ok := debug.ReadBuildInfo(); ok {
+		biVersion, biOK = info.Main.Version, true
+	}
+	return pickVersion(version, biVersion, biOK)
+})
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -224,7 +272,7 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 		Short:         "Brigsby manages AI coding-agent Artifacts safely.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		Version:       version,
+		Version:       resolveVersion(),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			return command.Help()
 		},
@@ -236,10 +284,10 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.PersistentFlags().String("jq", "", "filter JSON output with a jq expression (requires --json)")
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
-		Short: "Print the development version",
+		Short: "Print the Brigsby version",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			_, err := fmt.Fprintf(command.OutOrStdout(), "brigsby %s\n", version)
+			_, err := fmt.Fprintf(command.OutOrStdout(), "brigsby %s\n", resolveVersion())
 			return err
 		},
 	})

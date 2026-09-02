@@ -1855,6 +1855,64 @@ func TestCLIVersion(t *testing.T) {
 	}
 }
 
+func TestPickVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name      string
+		ldflag    string
+		biVersion string
+		biOK      bool
+		want      string
+	}{
+		{name: "ldflags injected wins", ldflag: "0.0.2", biVersion: "(devel)", biOK: true, want: "0.0.2"},
+		{name: "ldflags injected wins over build info", ldflag: "0.0.2", biVersion: "v0.0.3", biOK: true, want: "0.0.2"},
+		{name: "go install module version", ldflag: "dev", biVersion: "v0.0.2", biOK: true, want: "v0.0.2"},
+		{name: "go install prerelease tag", ldflag: "dev", biVersion: "v1.2.0-rc.1", biOK: true, want: "v1.2.0-rc.1"},
+		{name: "go install v2 incompatible tag", ldflag: "dev", biVersion: "v2.0.0+incompatible", biOK: true, want: "v2.0.0+incompatible"},
+		{name: "checkout build info is devel", ldflag: "dev", biVersion: "(devel)", biOK: true, want: "dev"},
+		{name: "checkout build pseudo-version", ldflag: "dev", biVersion: "v0.0.0-20260902105352-bfa9779124d0", biOK: true, want: "dev"},
+		{name: "checkout build dirty pseudo-version", ldflag: "dev", biVersion: "v0.0.0-20260902105352-bfa9779124d0+dirty", biOK: true, want: "dev"},
+		{name: "empty build info", ldflag: "dev", biVersion: "", biOK: true, want: "dev"},
+		{name: "no build info", ldflag: "dev", biVersion: "", biOK: false, want: "dev"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := pickVersion(testCase.ldflag, testCase.biVersion, testCase.biOK); got != testCase.want {
+				t.Fatalf("pickVersion(%q, %q, %t) = %q, want %q", testCase.ldflag, testCase.biVersion, testCase.biOK, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestCLIVersionCompiledBinary(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	for _, testCase := range []struct {
+		name    string
+		ldflags []string
+		want    string
+	}{
+		{name: "injected", ldflags: []string{"-ldflags", "-X main.version=1.2.3"}, want: "brigsby 1.2.3"},
+		{name: "checkout stays dev", ldflags: nil, want: "brigsby dev"},
+	} {
+		binary := filepath.Join(directory, "brigsby-"+testCase.name)
+		build := exec.Command("go", append(append([]string{"build"}, testCase.ldflags...), "-o", binary, ".")...)
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("%s build: %v\n%s", testCase.name, err, output)
+		}
+		for _, arguments := range [][]string{{"version"}, {"--version"}} {
+			output, err := exec.Command(binary, arguments...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s: brigsby %s: %v\n%s", testCase.name, strings.Join(arguments, " "), err, output)
+			}
+			if got := strings.TrimSpace(string(output)); got != testCase.want {
+				t.Fatalf("%s: brigsby %s = %q, want %q", testCase.name, strings.Join(arguments, " "), got, testCase.want)
+			}
+		}
+	}
+}
+
 func TestCLIUnknownCommandReportsActionableUsage(t *testing.T) {
 	t.Parallel()
 
