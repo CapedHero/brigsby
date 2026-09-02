@@ -10,6 +10,41 @@ OpenCode Harness projections; structured global Instructions; and text-only,
 integrity-checked Skill Packages. It deliberately does not execute package
 content, host a registry, or synchronize through a cloud service.
 
+## Install
+
+### macOS (Homebrew)
+
+```sh
+brew install CapedHero/brigsby/brigsby
+```
+
+Homebrew 6.0+ requires third-party taps to be trusted before their code runs;
+the fully-qualified name trusts just this formula and needs no separate step.
+To install and upgrade by the short `brigsby` name, trust the tap once:
+
+```sh
+brew tap CapedHero/brigsby
+brew trust --tap CapedHero/brigsby
+brew install brigsby
+```
+
+Either way the build compiles `brigsby` from source and pulls a Go toolchain as
+a build dependency. Confirm with `brigsby --version`.
+
+### Go toolchain
+
+```sh
+go install github.com/CapedHero/brigsby/cmd/brigsby@latest
+```
+
+### From a checkout
+
+```sh
+go build ./cmd/brigsby
+```
+
+A checkout build reports version `dev`; released installs report their tag.
+
 ## Development
 
 From a checkout, use these commands:
@@ -18,7 +53,6 @@ From a checkout, use these commands:
 go test ./...
 go test -run='^$' -bench=. ./...
 go build ./...
-go run ./cmd/brigsby --help
 go run ./cmd/brigsby --help
 ```
 
