@@ -15,7 +15,9 @@ Harnesses. Its leading loop is **observe → choose → act → verify**.
    uncertain option, also read the relevant nested help.
 2. If Brigsby is absent, the needed command is unavailable, or the help does
    not support the request, stop before mutation. State the exact gap and ask
-   the Caller to install, upgrade, or choose another approach.
+   the Caller to install, upgrade, or choose another approach. On macOS the
+   Caller can install with `brew install CapedHero/brigsby/brigsby`, or with
+   `go install github.com/CapedHero/brigsby/cmd/brigsby@latest`.
 
 Completion: the intended operation is supported by the installed CLI, and its
 current syntax is known.
