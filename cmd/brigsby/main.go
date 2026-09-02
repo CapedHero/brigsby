@@ -26,6 +26,26 @@ var (
 	errMachineInvalid   = errors.New("invalid machine output request")
 )
 
+// domainError is an actionable failure discovered while executing a valid
+// command. Unlike Cobra argument and flag errors, it should not be buried
+// beneath root help text.
+type domainError struct{ err error }
+
+func (err domainError) Error() string { return err.err.Error() }
+
+func (err domainError) Unwrap() error { return err.err }
+
+func domainErrorf(format string, arguments ...any) error {
+	return domainError{err: fmt.Errorf(format, arguments...)}
+}
+
+func asDomainError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return domainError{err: err}
+}
+
 // version is the release identity. It stays "dev" for an ordinary `go build`
 // or `go run` from a checkout and is overridden at release build time with
 // -ldflags "-X main.version=<tag>" (the Homebrew formula does this).
@@ -101,7 +121,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		if err != nil {
-			if isBlockedError(err) {
+			if isDomainError(err) {
 				return 3
 			}
 			return 1
@@ -113,7 +133,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 			_, _ = io.Copy(stdout, &commandOutput)
 			return 0
 		}
-		if isBlockedError(err) {
+		if isDomainError(err) {
 			fmt.Fprintln(stderr, err)
 			return 3
 		}
@@ -131,6 +151,11 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 
 func isBlockedError(err error) bool {
 	return err != nil && (errors.Is(err, errReportedProblems) || strings.Contains(err.Error(), "BLOCKED:"))
+}
+
+func isDomainError(err error) bool {
+	var domain domainError
+	return isBlockedError(err) || errors.As(err, &domain)
 }
 
 func hasOption(arguments []string, option string) bool {
@@ -161,6 +186,8 @@ func machineResult(arguments []string, output string, commandErr error) map[stri
 		code := "invalid_request"
 		if isBlockedError(commandErr) {
 			code = "blocked"
+		} else if isDomainError(commandErr) {
+			code = "domain_error"
 		}
 		result["problems"] = []map[string]string{{"code": code, "message": commandErr.Error()}}
 	}
@@ -366,6 +393,7 @@ func newAddRootAlias() *cobra.Command {
 			}
 		}
 	})
+	alias.Long = "Capture a local Artifact directory as an immutable canonical revision. A Skill path must be a directory containing SKILL.md."
 	alias.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
 	alias.Flags().StringVar(&name, "name", "", "canonical Artifact name")
 	alias.Flags().StringVar(&kind, "kind", "skills", "Artifact kind: skills or instructions")
@@ -422,7 +450,7 @@ func newPackageCommand() *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if output == "" {
-				return fmt.Errorf("package create requires --output <absolute-path>")
+				return domainErrorf("package create requires --output <absolute-path>")
 			}
 			root, err := brigsbyHome()
 			if err != nil {
@@ -448,10 +476,27 @@ func newPackageCommand() *cobra.Command {
 		RunE: func(command *cobra.Command, arguments []string) error {
 			result, err := portable.Inspect(arguments[0], expectedDigest)
 			if err != nil {
+				return asDomainError(err)
+			}
+			jsonFields, err := command.Root().PersistentFlags().GetString("json")
+			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "PACKAGE %s artifacts=%d\n", result.Digest, len(result.Artifacts))
-			return err
+			if jsonFields != "" {
+				return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
+					"command": "package inspect", "state": "clean", "problems": []any{},
+					"result": map[string]any{"digest": result.Digest, "artifacts": result.Artifacts},
+				})
+			}
+			if _, err := fmt.Fprintf(command.OutOrStdout(), "PACKAGE %s artifacts=%d\n", result.Digest, len(result.Artifacts)); err != nil {
+				return err
+			}
+			for _, revision := range result.Artifacts {
+				if _, err := fmt.Fprintf(command.OutOrStdout(), "ARTIFACT %s %s\n", revision.Selector, revision.Digest); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 	inspect.Flags().StringVar(&expectedDigest, "expect-digest", "", "expected Package digest")
@@ -468,7 +513,7 @@ func newPackageCommand() *cobra.Command {
 			if importDryRun {
 				revisions, err := portable.CheckImport(root, arguments[0], namespace)
 				if err != nil {
-					return err
+					return asDomainError(err)
 				}
 				for _, revision := range revisions {
 					if _, err := fmt.Fprintf(command.OutOrStdout(), "PLANNED import %s %s\n", revision.Selector, revision.Digest); err != nil {
@@ -479,7 +524,7 @@ func newPackageCommand() *cobra.Command {
 			}
 			revisions, err := portable.Import(root, arguments[0], namespace)
 			if err != nil {
-				return err
+				return asDomainError(err)
 			}
 			for _, revision := range revisions {
 				if _, err := fmt.Fprintf(command.OutOrStdout(), "IMPORTED %s %s\n", revision.Selector, revision.Digest); err != nil {
@@ -629,10 +674,11 @@ func newArtifactCommand() *cobra.Command {
 	add := &cobra.Command{
 		Use:   "add <path>",
 		Short: "Capture a local Artifact as an immutable canonical revision.",
+		Long:  "Capture a local Artifact as an immutable canonical revision. A Skill path must be a directory containing SKILL.md.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if kind != "skills" && kind != "instructions" {
-				return fmt.Errorf("unsupported Artifact kind %q", kind)
+				return domainErrorf("unsupported Artifact kind %q", kind)
 			}
 			root, err := brigsbyHome()
 			if err != nil {
@@ -647,7 +693,7 @@ func newArtifactCommand() *cobra.Command {
 				revision, err = store.CaptureSkill(arguments[0], options)
 			}
 			if err != nil {
-				return fmt.Errorf("capture Artifact: %w", err)
+				return domainErrorf("capture Artifact: %w", err)
 			}
 			_, err = fmt.Fprintf(command.OutOrStdout(), "CAPTURED %s %s\n", revision.Selector, revision.Digest)
 			return err
@@ -691,7 +737,7 @@ func newArtifactCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if selectRevision == "" {
-				return fmt.Errorf("select requires --revision sha256-<hex>")
+				return domainErrorf("select requires --revision sha256-<hex>")
 			}
 			root, err := brigsbyHome()
 			if err != nil {
@@ -723,7 +769,7 @@ func newArtifactCommand() *cobra.Command {
 		Use: "promote <namespace/kind/name>", Short: "Promote one imported Artifact Revision to main.", Long: "Promote one imported Artifact Revision to main. The selector is namespace/kind/name, for example friend/skills/release-notes.", Args: cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if promoteRevision == "" {
-				return fmt.Errorf("promote requires --revision sha256-<hex>")
+				return domainErrorf("promote requires --revision sha256-<hex>")
 			}
 			root, err := brigsbyHome()
 			if err != nil {
@@ -957,8 +1003,17 @@ func newHarnessCommand() *cobra.Command {
 				return fmt.Errorf("read Projections: %w", err)
 			}
 			jsonMode := jsonFields != ""
+			if len(linked) == 0 {
+				if jsonMode {
+					return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
+						"command": "harness status", "state": "clean", "problems": []any{},
+					})
+				}
+				_, err := fmt.Fprintln(command.OutOrStdout(), "No linked Harnesses.")
+				return err
+			}
 			var jsonProblems []map[string]any
-			driftCount, unownedCount := 0, 0
+			driftCount, staleCount, unownedCount := 0, 0, 0
 			write := func(format string, args ...any) error {
 				if jsonMode {
 					return nil
@@ -984,8 +1039,20 @@ func newHarnessCommand() *cobra.Command {
 					if err != nil && !os.IsNotExist(err) {
 						return fmt.Errorf("read selected Artifact: %w", err)
 					}
-					if err == nil && matches && selected.Digest == projection.Revision {
-						if err := write("PROJECTION %s %s %s\n", projection.Artifact, projection.Revision, projection.Path); err != nil {
+					if err == nil && matches {
+						if selected.Digest == projection.Revision {
+							if err := write("PROJECTION %s %s %s\n", projection.Artifact, projection.Revision, projection.Path); err != nil {
+								return err
+							}
+							continue
+						}
+						staleCount++
+						jsonProblems = append(jsonProblems, map[string]any{
+							"id":      fmt.Sprintf("stale-%02d", staleCount),
+							"code":    "projection_stale",
+							"message": fmt.Sprintf("Stale Projection %s %s", projection.Artifact, projection.Path),
+						})
+						if err := write("STALE %s %s\n", projection.Artifact, projection.Path); err != nil {
 							return err
 						}
 						continue
@@ -1020,8 +1087,10 @@ func newHarnessCommand() *cobra.Command {
 				state := "clean"
 				if driftCount > 0 {
 					state = "drifted"
+				} else if staleCount > 0 {
+					state = "stale"
 				} else if unownedCount > 0 {
-					state = "blocked"
+					state = "unowned"
 				}
 				if jsonProblems == nil {
 					jsonProblems = []map[string]any{}
@@ -1235,6 +1304,15 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 				return nil, fmt.Errorf("fingerprint rendered Skill content: %w", err)
 			}
 			if targetContent != "absent" && targetContent != replacementContent {
+				projection, owned := projectionFor(projections, targetHarness.ID, target)
+				stale, err := ownedProjectionIsStale(projection, owned, rendered.Revision, target)
+				if err != nil {
+					return nil, fmt.Errorf("fingerprint previous Projection: %w", err)
+				}
+				if stale {
+					targets = append(targets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: target, plan: plan, cleanup: rendered.Cleanup})
+					continue
+				}
 				if len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 {
 					return nil, fmt.Errorf("BLOCKED: %s differs from %s; narrow --harness and --artifact to one target before force sync", target, rendered.Revision.Selector)
 				}
@@ -1246,7 +1324,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 							break
 						}
 					}
-					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby artifact add %s' or rerun with --force --expect %s", kind, target, rendered.Revision.Selector, target, plan.TargetFingerprint())
+					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby artifact add %s --name %s' or rerun with --force --expect %s", kind, target, rendered.Revision.Selector, target, rendered.Name, plan.TargetFingerprint())
 				}
 				if expect != plan.TargetFingerprint() {
 					return nil, fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", plan.TargetFingerprint())
@@ -1293,6 +1371,25 @@ func projectionFingerprintMatches(path, expected string) (bool, error) {
 		return false, err
 	}
 	return exact == expected, nil
+}
+
+func projectionFor(projections []harness.Projection, harnessID, path string) (harness.Projection, bool) {
+	for _, projection := range projections {
+		if projection.HarnessID == harnessID && projection.Path == path {
+			return projection, true
+		}
+	}
+	return harness.Projection{}, false
+}
+
+// ownedProjectionIsStale reports whether the target is exactly the Projection
+// Brigsby last wrote, but its Artifact now selects a newer Revision. That is a
+// safe fast-forward; any local edit remains drift and must still be guarded.
+func ownedProjectionIsStale(projection harness.Projection, owned bool, revision artifact.Revision, path string) (bool, error) {
+	if !owned || projection.Artifact != revision.Selector || projection.Revision == revision.Digest {
+		return false, nil
+	}
+	return projectionFingerprintMatches(path, projection.Fingerprint)
 }
 
 func renderedInstructionPaths(targets []syncTarget) string {

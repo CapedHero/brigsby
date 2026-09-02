@@ -1,8 +1,7 @@
 # Contributing to Brigsby
 
-Brigsby development happens privately in `CapedHero/brigsby-dev`. The public
-`CapedHero/brigsby` repository receives reviewed release promotions and accepts
-external pull requests.
+The public `CapedHero/brigsby` repository accepts external pull requests and
+publishes reviewed releases.
 
 ## Before opening a public pull request
 
@@ -18,7 +17,7 @@ the public repository.
 
 ## Maintainer handling
 
-Brigsby maintainers review accepted public changes in the public repository,
-then import and verify them in private development before a later promotion,
-as specified by ADR 0011. Public contributors do not need private-repository
-access to submit or discuss a public pull request.
+Brigsby maintainers review accepted public changes and apply the project's
+standard verification before including them in a later release. Contributors do
+not need any special repository access to submit or discuss a public pull
+request.
