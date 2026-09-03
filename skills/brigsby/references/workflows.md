@@ -29,7 +29,7 @@ projection, so treat "kept" and "synchronized" as separate steps.
 ## Synchronize canonical content
 
 Sync only the requested scope. Select with `--skill namespace/name` and
-`--instruction namespace/name`; with neither, `brigsby harness sync` projects
+`--instruction namespace/name`; with neither, `brigsby sync` projects
 everything in `main`. A clean direct sync projects canonical content after
 Brigsby preflight; a dry run is the no-write preview. A blocked sync is
 information, not an invitation to merge: preserve the local content by adding

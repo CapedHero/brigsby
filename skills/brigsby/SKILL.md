@@ -15,7 +15,7 @@ leading loop is **observe → choose → act → verify**.
 1. Run `brigsby --help` when this task needs a command or capability you do
    not already know. Before a mutation, package operation, recovery, or any
    uncertain option, also read the relevant nested help (for example
-   `brigsby skill add --help`, `brigsby harness sync --help`).
+   `brigsby skill add --help`, `brigsby sync --help`).
 2. If Brigsby is absent, the needed command is unavailable, or the help does
    not support the request, stop before mutation. State the exact gap and ask
    the Caller to install, upgrade, or choose another approach. On macOS the
@@ -52,7 +52,7 @@ has been given the concrete choice needed to continue.
 1. Run the selected command using the syntax just confirmed by CLI help. A
    reference is `namespace/name` (default namespace `main`); the kind comes
    from the command group, or from `--skill` / `--instruction` on
-   `brigsby harness sync` and `brigsby package create`.
+   `brigsby sync` and `brigsby package create`.
 2. Every command result is one pretty-printed, key-sorted JSON envelope on
    stdout (`--help` and `--version` are the only plain-text output). Read
    `state` and `problems` as authoritative; a failure also echoes one line to

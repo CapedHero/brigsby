@@ -43,7 +43,7 @@ func BenchmarkHarnessSyncDryRun(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
+		if code := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
 			b.Fatalf("dry-run failed with %d: %s", code, stderr.String())
 		}
 	}

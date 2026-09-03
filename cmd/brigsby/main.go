@@ -124,7 +124,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	jqExpression, _ := root.PersistentFlags().GetString("jq")
 
 	// stdout always carries exactly one JSON envelope -- the machine contract.
-	result := machineResult(arguments, commandOutput.String(), err)
+	result := machineResult(commandOutput.String(), err)
 	if outputErr := writeMachineResult(stdout, result, jqExpression); outputErr != nil {
 		return 1
 	}
@@ -207,27 +207,22 @@ func encodeCanonicalJSON(w io.Writer, v any) error {
 
 // machineResult turns one command execution into the canonical envelope. A
 // command that ran to completion has already written its own
-// {command,state,problems,result,preview} object to output via emitResult; this
-// parses it and guarantees the five keys are present. Only a failure that
+// {state,problems,result} object to output via emitResult; this parses it and
+// guarantees those keys are present. Only a failure that
 // happened before the command could emit -- an unknown command, a bad flag, or
 // a domain/BLOCKED error returned from RunE -- needs an envelope synthesised
 // here.
-func machineResult(arguments []string, output string, commandErr error) map[string]any {
+func machineResult(output string, commandErr error) map[string]any {
 	result := map[string]any{
-		"command":  commandName(arguments),
 		"state":    "clean",
 		"problems": []any{},
 		"result":   nil,
-		"preview":  nil,
 	}
 	if commandErr == nil && json.Unmarshal([]byte(output), &result) == nil {
-		if _, found := result["command"]; !found {
-			result["command"] = commandName(arguments)
-		}
 		if _, found := result["state"]; !found {
 			result["state"] = "clean"
 		}
-		for _, key := range []string{"problems", "result", "preview"} {
+		for _, key := range []string{"problems", "result"} {
 			if _, found := result[key]; !found {
 				if key == "problems" {
 					result[key] = []any{}
@@ -254,56 +249,17 @@ func machineResult(arguments []string, output string, commandErr error) map[stri
 	return result
 }
 
-func commandName(arguments []string) string {
-	arguments = commandArguments(arguments)
-	if len(arguments) == 0 {
-		return "brigsby"
-	}
-	switch arguments[0] {
-	case "status":
-		return "harness status"
-	case "sync":
-		return "harness sync"
-	}
-	command := []string{arguments[0]}
-	if len(arguments) > 1 && !strings.HasPrefix(arguments[1], "-") {
-		switch arguments[0] {
-		case "harness", "skill", "instruction", "namespace", "package", "recovery":
-			command = append(command, arguments[1])
-		}
-	}
-	return strings.Join(command, " ")
-}
-
-func commandArguments(arguments []string) []string {
-	for len(arguments) > 0 {
-		argument := arguments[0]
-		if argument == "--jq" {
-			if len(arguments) < 2 {
-				return nil
-			}
-			arguments = arguments[2:]
-			continue
-		}
-		if strings.HasPrefix(argument, "--jq=") {
-			arguments = arguments[1:]
-			continue
-		}
-		break
-	}
-	return arguments
-}
-
 // writeMachineResult emits the final envelope. Without --jq it is the whole
-// {command,state,problems,result,preview} object; with --jq it is each value
+// {state,problems,result} object; with --jq it is each value
 // the expression yields, every one of them still pretty-printed and key-sorted.
 func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression string) error {
 	envelope := map[string]any{
-		"command":  result["command"],
 		"state":    result["state"],
 		"problems": result["problems"],
 		"result":   result["result"],
-		"preview":  result["preview"],
+	}
+	if recoveryIDs, found := result["recovery_ids"]; found {
+		envelope["recovery_ids"] = recoveryIDs
 	}
 	if jqExpression == "" {
 		return encodeCanonicalJSON(stdout, envelope)
@@ -333,11 +289,9 @@ func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression st
 		}
 	}
 	if encodeErr := encodeCanonicalJSON(stdout, map[string]any{
-		"command":  result["command"],
 		"state":    "invalid",
 		"problems": []map[string]string{{"code": "invalid_request", "message": fmt.Sprintf("invalid --jq expression: %v", err)}},
 		"result":   nil,
-		"preview":  nil,
 	}); encodeErr != nil {
 		return encodeErr
 	}
@@ -347,19 +301,17 @@ func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression st
 // emitResult is the ordinary way a command reports success: a canonical
 // envelope with no problems. run() re-reads it, applies --jq, and prints the
 // sorted, pretty result.
-func emitResult(out io.Writer, command, state string, result any) error {
-	return emitEnvelope(out, command, state, []any{}, result)
+func emitResult(out io.Writer, _ string, state string, result any) error {
+	return emitEnvelope(out, state, []any{}, result)
 }
 
 // emitEnvelope is emitResult for the few commands (harness status) that report
 // their own problem list alongside a result.
-func emitEnvelope(out io.Writer, command, state string, problems, result any) error {
+func emitEnvelope(out io.Writer, state string, problems, result any) error {
 	return encodeCanonicalJSON(out, map[string]any{
-		"command":  command,
 		"state":    state,
 		"problems": problems,
 		"result":   result,
-		"preview":  nil,
 	})
 }
 
@@ -446,7 +398,7 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newPackageCommand())
 	root.AddCommand(newRecoveryCommand())
 	root.AddCommand(newStatusRootAlias())
-	root.AddCommand(newSyncRootAlias())
+	root.AddCommand(newSyncCommand())
 	return root
 }
 
@@ -490,34 +442,6 @@ func newStatusRootAlias() *cobra.Command {
 	alias.Flags().BoolVar(&unowned, "unowned", false, "report only Unowned paths")
 	alias.Flags().BoolVar(&all, "all", false, "include managed Projections, Drift, and Unowned paths")
 	_ = alias.Flags().MarkHidden("managed")
-	return alias
-}
-
-func newSyncRootAlias() *cobra.Command {
-	var harnessIDs, skills, instructions []string
-	var force, dryRun bool
-	alias := newRootAlias("sync", []string{"harness", "sync"}, "Safely project selected canonical content to linked Harnesses.", func(command *cobra.Command, arguments *[]string) {
-		for _, value := range harnessIDs {
-			*arguments = append(*arguments, "--harness", value)
-		}
-		for _, value := range skills {
-			*arguments = append(*arguments, "--skill", value)
-		}
-		for _, value := range instructions {
-			*arguments = append(*arguments, "--instruction", value)
-		}
-		if force {
-			*arguments = append(*arguments, "--force")
-		}
-		if dryRun {
-			*arguments = append(*arguments, "--dry-run")
-		}
-	})
-	alias.Flags().StringArrayVar(&harnessIDs, "harness", nil, "linked Harness installation ID (repeatable)")
-	alias.Flags().StringArrayVar(&skills, "skill", nil, "selected Skill reference namespace/name (repeatable)")
-	alias.Flags().StringArrayVar(&instructions, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
-	alias.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
-	alias.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
 	return alias
 }
 
@@ -1011,7 +935,13 @@ func artifactFiles(root string) ([]map[string]any, error) {
 func newHarnessCommand() *cobra.Command {
 	harnessCommand := &cobra.Command{
 		Use:   "harness",
-		Short: "Discover, link, inspect, and synchronize Harnesses.",
+		Short: "Discover, link, and inspect Harnesses.",
+		RunE: func(command *cobra.Command, arguments []string) error {
+			if len(arguments) > 0 {
+				return fmt.Errorf("unknown command %q for %q", arguments[0], command.CommandPath())
+			}
+			return command.Help()
+		},
 	}
 	var harnessName string
 	discover := &cobra.Command{
@@ -1242,7 +1172,7 @@ func newHarnessCommand() *cobra.Command {
 			case unownedCount > 0:
 				state = "unowned"
 			}
-			return emitEnvelope(command.OutOrStdout(), "harness status", state, problems, map[string]any{
+			return emitEnvelope(command.OutOrStdout(), state, problems, map[string]any{
 				"linked":      linkedResult,
 				"projections": projectionResult,
 			})
@@ -1254,6 +1184,10 @@ func newHarnessCommand() *cobra.Command {
 	status.Flags().BoolVar(&statusAll, "all", false, "include managed Projections, Drift, and Unowned paths")
 	_ = status.Flags().MarkHidden("managed")
 	harnessCommand.AddCommand(status)
+	return harnessCommand
+}
+
+func newSyncCommand() *cobra.Command {
 	var linkedIDs, skillRefs, instructionRefs []string
 	var force, dryRun bool
 	sync := &cobra.Command{
@@ -1331,8 +1265,7 @@ func newHarnessCommand() *cobra.Command {
 	sync.Flags().StringArrayVar(&instructionRefs, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
 	sync.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
 	sync.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
-	harnessCommand.AddCommand(sync)
-	return harnessCommand
+	return sync
 }
 
 type syncTarget struct {
@@ -1621,13 +1554,15 @@ func writeSyncResults(command *cobra.Command, state string, targets []syncTarget
 			"operation": operation,
 		})
 	}
-	return encodeCanonicalJSON(command.OutOrStdout(), map[string]any{
-		"command":  "harness sync",
+	envelope := map[string]any{
 		"state":    state,
 		"problems": []any{},
 		"result":   results,
-		"preview":  map[string]any{"recovery_ids": recoveryOperationIDs(operations)},
-	})
+	}
+	if len(operations) > 0 {
+		envelope["recovery_ids"] = recoveryOperationIDs(operations)
+	}
+	return encodeCanonicalJSON(command.OutOrStdout(), envelope)
 }
 
 func recoveryOperationIDs(operations []recovery.Operation) []string {
@@ -1755,7 +1690,7 @@ func noteUntrackedSources(command *cobra.Command, root string, captured []artifa
 				continue
 			}
 			fmt.Fprintf(command.ErrOrStderr(),
-				"NOTE %s sits in the %s Harness skills path but is not drift-tracked; run 'brigsby harness sync --skill %s --harness %s' to project and track it\n",
+				"NOTE %s sits in the %s Harness skills path but is not drift-tracked; run 'brigsby sync --skill %s --harness %s' to project and track it\n",
 				absSource, candidate.Name, artifact.DisplayRef(captured[index].Selector), candidate.ID)
 			break
 		}

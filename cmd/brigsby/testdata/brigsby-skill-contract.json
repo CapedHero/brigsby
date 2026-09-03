@@ -22,7 +22,7 @@
     {"argv": ["harness", "status", "--help"], "contains": "Usage:\n  brigsby harness status"},
     {"argv": ["skill", "add", "--help"], "contains": "Usage:\n  brigsby skill add"},
     {"argv": ["instruction", "add", "--help"], "contains": "Usage:\n  brigsby instruction add"},
-    {"argv": ["harness", "sync", "--help"], "contains": "Usage:\n  brigsby harness sync"},
+    {"argv": ["sync", "--help"], "contains": "Usage:\n  brigsby sync"},
     {"argv": ["package", "create", "--help"], "contains": "Usage:\n  brigsby package create"},
     {"argv": ["package", "inspect", "--help"], "contains": "Usage:\n  brigsby package inspect"},
     {"argv": ["package", "import", "--help"], "contains": "Usage:\n  brigsby package import"},

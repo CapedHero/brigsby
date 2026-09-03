@@ -46,7 +46,7 @@ func TestRecoveryListShowsAppliedSyncOperation(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	recoveryID := firstSyncRecoveryID(t, "harness", "sync", "--harness", "codex", "--skill", "main/release-notes")
+	recoveryID := firstSyncRecoveryID(t, "sync", "--harness", "codex", "--skill", "main/release-notes")
 
 	var list struct {
 		Operations []struct {
@@ -99,7 +99,7 @@ func TestRecoveryShowInspectsAppliedSyncOperation(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	var syncPlan cliEnvelope
@@ -156,7 +156,7 @@ func TestRecoveryRestoreReinstatesPreimage(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	var syncPlan cliEnvelope
@@ -213,7 +213,7 @@ func TestRecoveryRestoreDryRunDoesNotWrite(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	var syncPlan cliEnvelope
@@ -274,7 +274,7 @@ func TestRecoveryRestoreBlocksWhenExpectDoesNotMatch(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	var syncPlan cliEnvelope
@@ -325,7 +325,7 @@ func TestHarnessStatusAfterRestoreDoesNotReportStaleProjection(t *testing.T) {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
 		}
 	}
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	var syncPlan cliEnvelope
@@ -387,14 +387,14 @@ func TestHarnessStatusAfterRestoreReportsUnownedPath(t *testing.T) {
 		}
 	}
 	var blockedOut, blockedErr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &blockedOut, &blockedErr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &blockedOut, &blockedErr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 3; stderr = %s", got, blockedErr.String())
 	}
 	if !strings.Contains(blockedErr.String(), "rerun with --force") {
 		t.Fatalf("blocked output = %q, want --force guidance", blockedErr.String())
 	}
 	var syncOut, syncErr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--force"}, &syncOut, &syncErr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--force"}, &syncOut, &syncErr); got != 0 {
 		t.Fatalf("force sync exit code = %d; stderr = %s", got, syncErr.String())
 	}
 	syncIDs := syncRecoveryIDs(t, decodeEnvelope(t, syncOut.Bytes()))
@@ -493,7 +493,7 @@ func TestCLIJSONEnvelopeSupportsSuccessDryRunBlockedResultAndJQ(t *testing.T) {
 			t.Fatalf("dry-run exit code = %d, want 0; stderr = %s", got, stderr.String())
 		}
 		result := decodeEnvelope(t, stdout.Bytes())
-		if result.Command != "namespace set-prefix" || result.State != "planned" || len(result.Problems) != 0 {
+		if result.State != "planned" || len(result.Problems) != 0 {
 			t.Fatalf("dry-run JSON = %s", stdout.String())
 		}
 	})
@@ -522,7 +522,7 @@ func TestCLIJSONEnvelopeSupportsSuccessDryRunBlockedResultAndJQ(t *testing.T) {
 			}
 		}
 		var stdout, stderr bytes.Buffer
-		if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+		if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 			t.Fatalf("blocked exit code = %d, want 3; stderr = %s", got, stderr.String())
 		}
 		result := decodeEnvelope(t, stdout.Bytes())
@@ -534,10 +534,10 @@ func TestCLIJSONEnvelopeSupportsSuccessDryRunBlockedResultAndJQ(t *testing.T) {
 
 func TestCLIAcceptsJQWithoutAnyFlag(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"version", "--jq", ".command"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"version", "--jq", ".result.version"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr = %s", got, stderr.String())
 	}
-	if got, want := strings.TrimSpace(stdout.String()), "\"version\""; got != want {
+	if got, want := strings.TrimSpace(stdout.String()), "\"dev\""; got != want {
 		t.Fatalf("jq result = %q, want %q", got, want)
 	}
 }
@@ -617,7 +617,7 @@ func TestHarnessUnlinkRemovesAssociationAndKeepsHarnessFiles(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -745,7 +745,7 @@ func TestHarnessDiscoverLinkAndSyncClaudeFixture(t *testing.T) {
 	if !strings.Contains(discoverOut.String(), "claude") || !strings.Contains(discoverOut.String(), skills) {
 		t.Fatalf("discover output = %q, want Claude fixture", discoverOut.String())
 	}
-	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}} {
+	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"sync", "--harness", "claude", "--skill", "main/release-notes"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -781,7 +781,7 @@ func TestHarnessDiscoverLinkAndSyncOpenCodeFixture(t *testing.T) {
 	if !strings.Contains(discoverOut.String(), "opencode") || !strings.Contains(discoverOut.String(), skills) {
 		t.Fatalf("discover output = %q, want OpenCode fixture", discoverOut.String())
 	}
-	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"skill", "add", source}, {"harness", "sync", "--harness", "opencode", "--skill", "main/release-notes"}} {
+	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"skill", "add", source}, {"sync", "--harness", "opencode", "--skill", "main/release-notes"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -816,7 +816,7 @@ func TestHarnessSyncProjectsStructuredGlobalInstructionsToCodex(t *testing.T) {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"instruction", "add", source}, {"harness", "sync", "--harness", "codex", "--instruction", "main/personal-instructions"}} {
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"instruction", "add", source}, {"sync", "--harness", "codex", "--instruction", "main/personal-instructions"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1045,7 +1045,7 @@ func TestHarnessSyncSelectsOnlyClaudeInstructionException(t *testing.T) {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"instruction", "add", source}, {"harness", "sync", "--harness", "claude", "--instruction", "main/personal-instructions"}} {
+	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"instruction", "add", source}, {"sync", "--harness", "claude", "--instruction", "main/personal-instructions"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1083,7 +1083,7 @@ func TestHarnessSyncProjectsStructuredGlobalInstructionsToOpenCode(t *testing.T)
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"instruction", "add", source}, {"harness", "sync", "--harness", "opencode", "--instruction", "main/personal-instructions"}} {
+	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"instruction", "add", source}, {"sync", "--harness", "opencode", "--instruction", "main/personal-instructions"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1114,7 +1114,7 @@ func TestHarnessSyncBlocksDriftedGlobalInstructionProjection(t *testing.T) {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"instruction", "add", source}, {"harness", "sync", "--harness", "codex", "--instruction", "main/personal-instructions"}} {
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"instruction", "add", source}, {"sync", "--harness", "codex", "--instruction", "main/personal-instructions"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1124,7 +1124,7 @@ func TestHarnessSyncBlocksDriftedGlobalInstructionProjection(t *testing.T) {
 		t.Fatalf("edit projected Instruction root: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--instruction", "main/personal-instructions"}, &stdout, &stderr); got != 3 || !strings.Contains(stderr.String(), "BLOCKED: Instruction Projection") {
+	if got := run([]string{"sync", "--harness", "codex", "--instruction", "main/personal-instructions"}, &stdout, &stderr); got != 3 || !strings.Contains(stderr.String(), "BLOCKED: Instruction Projection") {
 		t.Fatalf("drifted sync exit=%d stderr=%q", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "rerun with --force") {
@@ -1132,7 +1132,7 @@ func TestHarnessSyncBlocksDriftedGlobalInstructionProjection(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--instruction", "main/personal-instructions", "--force"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--instruction", "main/personal-instructions", "--force"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("force sync exit=%d stderr=%q", got, stderr.String())
 	}
 }
@@ -1154,7 +1154,7 @@ func TestNamespacePrefixRendersOpenCodeSkillAtNativePath(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"skill", "add", source}, {"namespace", "set-prefix", "main", "mw-"}, {"harness", "sync", "--harness", "opencode", "--skill", "main/release-notes"}} {
+	for _, arguments := range [][]string{{"harness", "link", "opencode"}, {"skill", "add", source}, {"namespace", "set-prefix", "main", "mw-"}, {"sync", "--harness", "opencode", "--skill", "main/release-notes"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1187,7 +1187,7 @@ func TestNamespacePrefixRendersClaudeSkillDirectoryAndFrontmatter(t *testing.T) 
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"namespace", "set-prefix", "main", "mw-"}, {"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}} {
+	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"namespace", "set-prefix", "main", "mw-"}, {"sync", "--harness", "claude", "--skill", "main/release-notes"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1220,7 +1220,7 @@ func TestNamespacePrefixMigratesExistingClaudeProjection(t *testing.T) {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}, {"namespace", "set-prefix", "main", "mw-"}, {"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}} {
+	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"sync", "--harness", "claude", "--skill", "main/release-notes"}, {"namespace", "set-prefix", "main", "mw-"}, {"sync", "--harness", "claude", "--skill", "main/release-notes"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1249,7 +1249,7 @@ func TestNamespacePrefixBlocksMigrationWhenPreviousClaudeProjectionDrifted(t *te
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}, {"namespace", "set-prefix", "main", "mw-"}} {
+	for _, arguments := range [][]string{{"harness", "link", "claude"}, {"skill", "add", source}, {"sync", "--harness", "claude", "--skill", "main/release-notes"}, {"namespace", "set-prefix", "main", "mw-"}} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
 			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
@@ -1259,7 +1259,7 @@ func TestNamespacePrefixBlocksMigrationWhenPreviousClaudeProjectionDrifted(t *te
 		t.Fatalf("drift previous projection: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "claude", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "claude", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 3; stderr = %s", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "previous Projection") || !strings.Contains(stderr.String(), "drifted") {
@@ -1490,7 +1490,7 @@ func TestHarnessStatusReportsCleanProjectionAfterSync(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1529,7 +1529,7 @@ func TestHarnessStatusReportsDriftAfterProjectedSkillIsEdited(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1603,7 +1603,7 @@ func TestHarnessStatusReportsStaleProjectionWhenSelectedRevisionChanges(t *testi
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1646,7 +1646,7 @@ func TestHarnessSyncFastForwardsPristineStaleProjectionWithRecovery(t *testing.T
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1662,12 +1662,12 @@ func TestHarnessSyncFastForwardsPristineStaleProjectionWithRecovery(t *testing.T
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); got != 0 || decodeEnvelope(t, stdout.Bytes()).State != "planned" {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); got != 0 || decodeEnvelope(t, stdout.Bytes()).State != "planned" {
 		t.Fatalf("fast-forward dry-run exit=%d stdout=%q stderr=%q", got, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("fast-forward sync exit=%d stderr=%q", got, stderr.String())
 	}
 	syncIDs := syncRecoveryIDs(t, decodeEnvelope(t, stdout.Bytes()))
@@ -1708,7 +1708,7 @@ func TestHarnessSyncBlocksEditedStaleProjection(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1727,7 +1727,7 @@ func TestHarnessSyncBlocksEditedStaleProjection(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("edited stale sync exit=%d stderr=%q", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "BLOCKED: Drift") || strings.Contains(stderr.String(), "Usage:") {
@@ -1753,7 +1753,7 @@ func TestHarnessStatusJSONReportsDrift(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1769,7 +1769,7 @@ func TestHarnessStatusJSONReportsDrift(t *testing.T) {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	result := decodeEnvelope(t, stdout.Bytes())
-	if result.Command != "harness status" || result.State != "drifted" {
+	if result.State != "drifted" {
 		t.Fatalf("JSON result = %s", stdout.String())
 	}
 	if len(result.Problems) != 1 || result.Problems[0].Code != "projection_drift" {
@@ -1812,7 +1812,7 @@ func TestHarnessSyncPreflightBlocksEverySelectedHarnessWhenOneHasCollision(t *te
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--harness", "codex-work", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--harness", "codex-work", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 2; stderr = %s", got, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "BLOCKED") {
@@ -1853,7 +1853,7 @@ func TestHarnessSyncProjectsSkillToEverySelectedHarness(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--harness", "codex-work", "--skill", "main/release-notes"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--harness", "codex-work", "--skill", "main/release-notes"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("sync exit code = %d; stderr = %s", got, stderr.String())
 	}
 	for _, skills := range []string{personalSkills, workSkills} {
@@ -1887,7 +1887,7 @@ func TestHarnessSyncProjectsSelectedSkillToLinkedCodexFixture(t *testing.T) {
 		}
 	}
 	var syncOut, syncErr bytes.Buffer
-	if got, want := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr), 0; got != want {
+	if got, want := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &syncOut, &syncErr), 0; got != want {
 		t.Fatalf("sync exit code = %d, want %d; stderr = %s", got, want, syncErr.String())
 	}
 	contents, err := os.ReadFile(filepath.Join(skills, "release-notes", "SKILL.md"))
@@ -1928,7 +1928,7 @@ func TestHarnessSyncBlocksUnownedPathWithSkillAddAndForce(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 3; stderr = %s", got, stderr.String())
 	}
 	output := stderr.String()
@@ -1961,7 +1961,7 @@ func TestHarnessSyncBlocksDriftWithSkillAddAndForce(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"harness", "link", "codex"},
 		{"skill", "add", source},
-		{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if got := run(arguments, &stdout, &stderr); got != 0 {
@@ -1973,7 +1973,7 @@ func TestHarnessSyncBlocksDriftWithSkillAddAndForce(t *testing.T) {
 		t.Fatalf("edit projected Skill: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 3; stderr = %s", got, stderr.String())
 	}
 	output := stderr.String()
@@ -2010,7 +2010,7 @@ func TestHarnessSyncBlocksChangedTargetWithAReadyToRunForce(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes"}, &stdout, &stderr); got != 3 {
 		t.Fatalf("sync exit code = %d, want 3; stderr = %s", got, stderr.String())
 	}
 	if output := stderr.String(); !strings.Contains(output, "BLOCKED") || !strings.Contains(output, "rerun with --force") {
@@ -2018,7 +2018,7 @@ func TestHarnessSyncBlocksChangedTargetWithAReadyToRunForce(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--force"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--force"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("force exit code = %d; stderr = %s", got, stderr.String())
 	}
 	contents, err := os.ReadFile(filepath.Join(skills, "release-notes", "SKILL.md"))
@@ -2049,11 +2049,11 @@ func TestHarnessSyncReportsAProvisionalJSONPlan(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("sync exit code = %d, want 0; stderr = %s", got, stderr.String())
 	}
 	result := decodeEnvelope(t, stdout.Bytes())
-	if result.Command != "harness sync" || result.State != "planned" {
+	if result.State != "planned" {
 		t.Fatalf("JSON result = %s", stdout.String())
 	}
 	if _, err := os.Stat(filepath.Join(skills, "release-notes")); !os.IsNotExist(err) {
@@ -2163,6 +2163,16 @@ func TestCLIUnknownCommandReportsActionableUsage(t *testing.T) {
 	}
 }
 
+func TestHarnessSyncIsNotACommand(t *testing.T) {
+	code, envelope, stderr := execCLI(t, "harness", "sync")
+	if code != 2 || envelope.State != "invalid" {
+		t.Fatalf("harness sync code=%d envelope=%+v, want invalid command", code, envelope)
+	}
+	if !strings.Contains(stderr, "unknown command \"sync\"") {
+		t.Fatalf("harness sync stderr=%q, want unknown-command diagnostic", stderr)
+	}
+}
+
 func TestProjectionFingerprintMatchesLegacyExactFingerprint(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "release-notes")
@@ -2250,9 +2260,6 @@ func TestCLIUsabilityFixesForSafeObservationAndExistingSkills(t *testing.T) {
 	if got := run([]string{"harness", "discover"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("discover exit=%d stderr=%s", got, stderr.String())
 	}
-	if command := decodeEnvelope(t, stdout.Bytes()).Command; command != "harness discover" {
-		t.Fatalf("discover command=%q, want harness discover", command)
-	}
 	stdout.Reset()
 	stderr.Reset()
 	if got := run([]string{"instruction", "add", filepath.Join(home, ".codex")}, &stdout, &stderr); got != 3 || !strings.Contains(stderr.String(), "structured Instruction set") || strings.Contains(stderr.String(), "Usage:") {
@@ -2274,11 +2281,10 @@ func TestCLIVersionRejectsArguments(t *testing.T) {
 
 // cliEnvelope is the single JSON object every command prints to stdout.
 type cliEnvelope struct {
-	Command  string          `json:"command"`
-	State    string          `json:"state"`
-	Problems []cliProblem    `json:"problems"`
-	Result   json.RawMessage `json:"result"`
-	Preview  json.RawMessage `json:"preview"`
+	State       string          `json:"state"`
+	Problems    []cliProblem    `json:"problems"`
+	Result      json.RawMessage `json:"result"`
+	RecoveryIDs []string        `json:"recovery_ids"`
 }
 
 type cliProblem struct {
@@ -2419,18 +2425,10 @@ func (e cliEnvelope) problemCodes() []string {
 	return codes
 }
 
-// syncRecoveryIDs returns preview.recovery_ids from a harness sync envelope.
+// syncRecoveryIDs returns recovery_ids from a sync envelope.
 func syncRecoveryIDs(t *testing.T, e cliEnvelope) []string {
 	t.Helper()
-	var preview struct {
-		RecoveryIDs []string `json:"recovery_ids"`
-	}
-	if len(e.Preview) > 0 {
-		if err := json.Unmarshal(e.Preview, &preview); err != nil {
-			t.Fatalf("decode sync preview %s: %v", e.Preview, err)
-		}
-	}
-	return preview.RecoveryIDs
+	return e.RecoveryIDs
 }
 
 // firstSyncRecoveryID runs a sync, requires success, and returns its single
@@ -2440,7 +2438,7 @@ func firstSyncRecoveryID(t *testing.T, arguments ...string) string {
 	envelope := mustCLI(t, arguments...)
 	ids := syncRecoveryIDs(t, envelope)
 	if len(ids) == 0 {
-		t.Fatalf("brigsby %s: no recovery_ids in preview %s", strings.Join(arguments, " "), envelope.Preview)
+		t.Fatalf("brigsby %s: no recovery_ids in %s", strings.Join(arguments, " "), envelope.Result)
 	}
 	return ids[0]
 }
@@ -2577,7 +2575,7 @@ func TestArtifactAddNotesUntrackedLinkedHarnessSource(t *testing.T) {
 		t.Fatalf("add result = %q, want captured Artifact", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "NOTE ") || !strings.Contains(stderr.String(), "not drift-tracked") ||
-		!strings.Contains(stderr.String(), "brigsby harness sync --skill main/release-notes --harness codex") {
+		!strings.Contains(stderr.String(), "brigsby sync --skill main/release-notes --harness codex") {
 		t.Fatalf("add advisory = %q, want untracked-source NOTE with the sync command", stderr.String())
 	}
 }
