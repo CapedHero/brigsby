@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'CapedHero/brigsby'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          stage="brigsby_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${stage}"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${version}" \
+            -o "dist/${stage}/brigsby" ./cmd/brigsby
+          cp LICENSE README.md "dist/${stage}/"
+          tar -C "dist/${stage}" -czf "dist/${stage}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brigsby_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/brigsby_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: github.repository == 'CapedHero/brigsby'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write checksums
+        run: |
+          set -eu
+          cd dist
+          sha256sum brigsby_*.tar.gz > checksums.txt
+          cat checksums.txt
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/brigsby_*.tar.gz
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/brigsby_*.tar.gz dist/checksums.txt
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$GITHUB_REF_NAME" --generate-notes \
+              dist/brigsby_*.tar.gz dist/checksums.txt
+          fi

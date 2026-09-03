@@ -40,7 +40,7 @@ func TestStoreCapturesSkillAsSelectedDigestRevision(t *testing.T) {
 	if selected != revision {
 		t.Fatalf("selected = %#v, want %#v", selected, revision)
 	}
-	contents, err := os.ReadFile(filepath.Join(root, "artifacts", "main", "skills", "release-notes", "revisions", revision.Digest, "files", "references", "usage.md"))
+	contents, err := os.ReadFile(filepath.Join(root, "skills", "main", "release-notes", "revisions", revision.Digest, "files", "references", "usage.md"))
 	if err != nil {
 		t.Fatalf("read captured file: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestStoreRejectsAChangedCanonicalRevisionBeforeProjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capture: %v", err)
 	}
-	path := filepath.Join(root, "artifacts", "main", "skills", "release-notes", "revisions", revision.Digest, "files", "SKILL.md")
+	path := filepath.Join(root, "skills", "main", "release-notes", "revisions", revision.Digest, "files", "SKILL.md")
 	if err := os.WriteFile(path, []byte("tampered\n"), 0o644); err != nil {
 		t.Fatalf("tamper with canonical content: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestStoreRendersPrefixedSkillWithoutChangingCanonicalRevision(t *testing.T)
 	if !strings.Contains(string(renderedContents), "name: mw-release-notes") {
 		t.Fatalf("rendered Skill = %q", renderedContents)
 	}
-	canonicalContents, err := os.ReadFile(filepath.Join(root, "artifacts", "main", "skills", "release-notes", "revisions", rendered.Revision.Digest, "files", "SKILL.md"))
+	canonicalContents, err := os.ReadFile(filepath.Join(root, "skills", "main", "release-notes", "revisions", rendered.Revision.Digest, "files", "SKILL.md"))
 	if err != nil || string(canonicalContents) != canonical {
 		t.Fatalf("canonical Skill changed = %q (err=%v)", canonicalContents, err)
 	}

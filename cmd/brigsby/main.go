@@ -21,10 +21,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	errReportedProblems = errors.New("reported problems")
-	errMachineInvalid   = errors.New("invalid machine output request")
-)
+var errMachineInvalid = errors.New("invalid machine output request")
 
 // domainError is an actionable failure discovered while executing a valid
 // command. Unlike Cobra argument and flag errors, it should not be buried
@@ -102,55 +99,72 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// run executes one CLI invocation. Every command result is emitted to stdout as
+// a single pretty-printed, alphabetically key-sorted JSON envelope so that the
+// only audience that has to parse Brigsby is an agent or a script. The
+// exceptions are the conventional plain-text affordances: `--help`, `-h`, the
+// `help` subcommand, a bare invocation, and `--version` print human text,
+// exactly as every peer CLI does. (`brigsby version` still emits the envelope.)
 func run(arguments []string, stdout, stderr io.Writer) int {
 	root := newRootCommand(stdout, stderr)
-	if hasOption(arguments, "--jq") && !hasOption(arguments, "--json") {
-		fmt.Fprintln(stderr, "--jq requires --json")
-		return 2
+
+	if wantsPlainText(arguments) {
+		root.SetArgs(arguments)
+		if err := root.Execute(); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		return 0
 	}
-	jsonRequested := hasOption(arguments, "--json")
+
 	var commandOutput bytes.Buffer
 	root.SetOut(&commandOutput)
 	root.SetArgs(arguments)
 	err := root.Execute()
-	jsonFields, _ := root.PersistentFlags().GetString("json")
 	jqExpression, _ := root.PersistentFlags().GetString("jq")
-	if jsonRequested && jsonFields != "" {
-		result := machineResult(arguments, commandOutput.String(), err)
-		if outputErr := writeMachineResult(stdout, result, jsonFields, jqExpression); outputErr != nil {
-			return 1
-		}
-		if err != nil {
-			if isDomainError(err) {
-				return 3
-			}
-			return 1
-		}
+
+	// stdout always carries exactly one JSON envelope -- the machine contract.
+	result := machineResult(arguments, commandOutput.String(), err)
+	if outputErr := writeMachineResult(stdout, result, jqExpression); outputErr != nil {
+		return 1
+	}
+	if err == nil {
 		return 0
 	}
-	if err != nil {
-		if errors.Is(err, errReportedProblems) {
-			_, _ = io.Copy(stdout, &commandOutput)
-			return 0
-		}
-		if isDomainError(err) {
-			fmt.Fprintln(stderr, err)
-			return 3
-		}
+	// stderr carries a one-line human diagnostic on failure. It is never parsed;
+	// a caller keys off the exit code and the stdout envelope's state/problems.
+	if isDomainError(err) {
 		fmt.Fprintln(stderr, err)
-		fmt.Fprintln(stderr)
-		root.SetOut(stderr)
-		if helpErr := root.Help(); helpErr != nil {
-			fmt.Fprintln(stderr, helpErr)
-		}
-		return 2
+		return 3
 	}
-	_, _ = io.Copy(stdout, &commandOutput)
-	return 0
+	fmt.Fprintln(stderr, err)
+	fmt.Fprintln(stderr)
+	root.SetOut(stderr)
+	if helpErr := root.Help(); helpErr != nil {
+		fmt.Fprintln(stderr, helpErr)
+	}
+	return 2
+}
+
+// wantsPlainText reports whether the invocation is a conventional plain-text
+// affordance (help or version) rather than a command result.
+func wantsPlainText(arguments []string) bool {
+	if len(arguments) == 0 {
+		return true
+	}
+	if arguments[0] == "help" {
+		return true
+	}
+	for _, argument := range arguments {
+		if argument == "--help" || argument == "-h" || argument == "--version" {
+			return true
+		}
+	}
+	return false
 }
 
 func isBlockedError(err error) bool {
-	return err != nil && (errors.Is(err, errReportedProblems) || strings.Contains(err.Error(), "BLOCKED:"))
+	return err != nil && strings.Contains(err.Error(), "BLOCKED:")
 }
 
 func isDomainError(err error) bool {
@@ -158,38 +172,84 @@ func isDomainError(err error) bool {
 	return isBlockedError(err) || errors.As(err, &domain)
 }
 
-func hasOption(arguments []string, option string) bool {
-	for _, argument := range arguments {
-		if argument == option || strings.HasPrefix(argument, option+"=") {
-			return true
-		}
+// canonicalValue re-serialises any value so that every nested object becomes a
+// map[string]any (whose keys encoding/json emits in alphabetical order) and
+// every exotic concrete type collapses to a plain JSON kind. It is the single
+// choke point that makes Brigsby's output deterministic and sorted at every
+// depth.
+func canonicalValue(v any) (any, error) {
+	compact, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
 	}
-	return false
+	var normalized any
+	if err := json.Unmarshal(compact, &normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
 }
 
+// encodeCanonicalJSON writes v as pretty-printed, alphabetically key-sorted
+// JSON followed by a newline. Every byte Brigsby prints as a result goes
+// through here.
+func encodeCanonicalJSON(w io.Writer, v any) error {
+	normalized, err := canonicalValue(v)
+	if err != nil {
+		return err
+	}
+	pretty, err := json.MarshalIndent(normalized, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(pretty, '\n'))
+	return err
+}
+
+// machineResult turns one command execution into the canonical envelope. A
+// command that ran to completion has already written its own
+// {command,state,problems,result,preview} object to output via emitResult; this
+// parses it and guarantees the five keys are present. Only a failure that
+// happened before the command could emit -- an unknown command, a bad flag, or
+// a domain/BLOCKED error returned from RunE -- needs an envelope synthesised
+// here.
 func machineResult(arguments []string, output string, commandErr error) map[string]any {
 	result := map[string]any{
 		"command":  commandName(arguments),
-		"state":    outputState(output, arguments, commandErr),
+		"state":    "clean",
 		"problems": []any{},
+		"result":   nil,
+		"preview":  nil,
 	}
-	if json.Unmarshal([]byte(output), &result) == nil {
-		if _, found := result["problems"]; !found {
-			result["problems"] = []any{}
+	if commandErr == nil && json.Unmarshal([]byte(output), &result) == nil {
+		if _, found := result["command"]; !found {
+			result["command"] = commandName(arguments)
+		}
+		if _, found := result["state"]; !found {
+			result["state"] = "clean"
+		}
+		for _, key := range []string{"problems", "result", "preview"} {
+			if _, found := result[key]; !found {
+				if key == "problems" {
+					result[key] = []any{}
+				} else {
+					result[key] = nil
+				}
+			}
 		}
 		return result
 	}
-	if trimmed := strings.TrimSpace(output); trimmed != "" {
-		result["result"] = map[string]any{"output": trimmed}
+	code, state := "invalid_request", "invalid"
+	switch {
+	case isBlockedError(commandErr):
+		code, state = "blocked", "blocked"
+	case isDomainError(commandErr):
+		code = "domain_error"
 	}
+	result["state"] = state
 	if commandErr != nil {
-		code := "invalid_request"
-		if isBlockedError(commandErr) {
-			code = "blocked"
-		} else if isDomainError(commandErr) {
-			code = "domain_error"
-		}
 		result["problems"] = []map[string]string{{"code": code, "message": commandErr.Error()}}
+	} else if trimmed := strings.TrimSpace(output); trimmed != "" {
+		result["result"] = map[string]any{"output": trimmed}
 	}
 	return result
 }
@@ -200,8 +260,6 @@ func commandName(arguments []string) string {
 		return "brigsby"
 	}
 	switch arguments[0] {
-	case "add":
-		return "artifact add"
 	case "status":
 		return "harness status"
 	case "sync":
@@ -210,7 +268,7 @@ func commandName(arguments []string) string {
 	command := []string{arguments[0]}
 	if len(arguments) > 1 && !strings.HasPrefix(arguments[1], "-") {
 		switch arguments[0] {
-		case "harness", "artifact", "namespace", "package", "recovery":
+		case "harness", "skill", "instruction", "namespace", "package", "recovery":
 			command = append(command, arguments[1])
 		}
 	}
@@ -220,14 +278,14 @@ func commandName(arguments []string) string {
 func commandArguments(arguments []string) []string {
 	for len(arguments) > 0 {
 		argument := arguments[0]
-		if argument == "--json" || argument == "--jq" {
+		if argument == "--jq" {
 			if len(arguments) < 2 {
 				return nil
 			}
 			arguments = arguments[2:]
 			continue
 		}
-		if strings.HasPrefix(argument, "--json=") || strings.HasPrefix(argument, "--jq=") {
+		if strings.HasPrefix(argument, "--jq=") {
 			arguments = arguments[1:]
 			continue
 		}
@@ -236,95 +294,126 @@ func commandArguments(arguments []string) []string {
 	return arguments
 }
 
-func outputState(output string, arguments []string, commandErr error) string {
-	if commandErr != nil {
-		if isBlockedError(commandErr) {
-			return "blocked"
-		}
-		return "invalid"
-	}
-	if hasOption(arguments, "--dry-run") || strings.HasPrefix(strings.TrimSpace(output), "PLANNED ") {
-		return "planned"
-	}
-	if strings.HasPrefix(strings.TrimSpace(output), "CLEAN ") || commandName(arguments) == "version" {
-		return "clean"
-	}
-	return "applied"
-}
-
-func writeMachineResult(stdout io.Writer, result map[string]any, fields, jqExpression string) error {
-	selected, err := selectMachineFields(result, fields)
-	if err != nil {
-		if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
-			"command":  result["command"],
-			"state":    "invalid",
-			"problems": []map[string]string{{"code": "invalid_request", "message": err.Error()}},
-		}); encodeErr != nil {
-			return encodeErr
-		}
-		return errMachineInvalid
+// writeMachineResult emits the final envelope. Without --jq it is the whole
+// {command,state,problems,result,preview} object; with --jq it is each value
+// the expression yields, every one of them still pretty-printed and key-sorted.
+func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression string) error {
+	envelope := map[string]any{
+		"command":  result["command"],
+		"state":    result["state"],
+		"problems": result["problems"],
+		"result":   result["result"],
+		"preview":  result["preview"],
 	}
 	if jqExpression == "" {
-		return json.NewEncoder(stdout).Encode(selected)
+		return encodeCanonicalJSON(stdout, envelope)
 	}
-	query, err := gojq.Parse(jqExpression)
+	input, err := canonicalValue(envelope)
 	if err == nil {
-		var code *gojq.Code
-		code, err = gojq.Compile(query)
+		var query *gojq.Query
+		query, err = gojq.Parse(jqExpression)
 		if err == nil {
-			iterator := code.Run(selected)
-			for {
-				value, ok := iterator.Next()
-				if !ok {
-					return nil
-				}
-				if valueErr, isError := value.(error); isError {
-					err = valueErr
-					break
-				}
-				if encodeErr := json.NewEncoder(stdout).Encode(value); encodeErr != nil {
-					return encodeErr
+			var code *gojq.Code
+			if code, err = gojq.Compile(query); err == nil {
+				iterator := code.Run(input)
+				for {
+					value, ok := iterator.Next()
+					if !ok {
+						return nil
+					}
+					if valueErr, isError := value.(error); isError {
+						err = valueErr
+						break
+					}
+					if encodeErr := encodeCanonicalJSON(stdout, value); encodeErr != nil {
+						return encodeErr
+					}
 				}
 			}
 		}
 	}
-	if encodeErr := json.NewEncoder(stdout).Encode(map[string]any{
+	if encodeErr := encodeCanonicalJSON(stdout, map[string]any{
 		"command":  result["command"],
 		"state":    "invalid",
 		"problems": []map[string]string{{"code": "invalid_request", "message": fmt.Sprintf("invalid --jq expression: %v", err)}},
+		"result":   nil,
+		"preview":  nil,
 	}); encodeErr != nil {
 		return encodeErr
 	}
 	return errMachineInvalid
 }
 
-func selectMachineFields(result map[string]any, fields string) (map[string]any, error) {
-	selected := map[string]any{
-		"command":  result["command"],
-		"state":    result["state"],
-		"problems": result["problems"],
+// emitResult is the ordinary way a command reports success: a canonical
+// envelope with no problems. run() re-reads it, applies --jq, and prints the
+// sorted, pretty result.
+func emitResult(out io.Writer, command, state string, result any) error {
+	return emitEnvelope(out, command, state, []any{}, result)
+}
+
+// emitEnvelope is emitResult for the few commands (harness status) that report
+// their own problem list alongside a result.
+func emitEnvelope(out io.Writer, command, state string, problems, result any) error {
+	return encodeCanonicalJSON(out, map[string]any{
+		"command":  command,
+		"state":    state,
+		"problems": problems,
+		"result":   result,
+		"preview":  nil,
+	})
+}
+
+// contentRef is the canonical shape for a Skill or Instruction Revision wherever
+// a result names one: a lower-case, sorted {digest, kind, ref} object. key is
+// the internal store key "namespace/kind/name"; ref renders as "namespace/name".
+func contentRef(key, digest string) map[string]any {
+	return map[string]any{"digest": digest, "kind": kindWord(key), "ref": artifact.DisplayRef(key)}
+}
+
+// kindWord maps an internal key's kind to its Caller-facing singular.
+func kindWord(key string) string {
+	if artifact.KeyKind(key) == artifact.KindInstruction {
+		return "instruction"
 	}
-	if fields == "all" {
-		for _, field := range []string{"result", "preview"} {
-			if value, found := result[field]; found {
-				selected[field] = value
-			}
-		}
-		return selected, nil
+	return "skill"
+}
+
+// displayContent renders "<kind> <namespace/name>" for an internal key, for use
+// in human diagnostic strings.
+func displayContent(key string) string {
+	return kindWord(key) + " " + artifact.DisplayRef(key)
+}
+
+// refName returns the trailing name segment of a "namespace/name" reference.
+func refName(ref string) string {
+	if slash := strings.LastIndexByte(ref, '/'); slash >= 0 {
+		return ref[slash+1:]
 	}
-	for _, field := range strings.Split(fields, ",") {
-		field = strings.TrimSpace(field)
-		if field == "" || field == "command" || field == "state" || field == "problems" {
-			continue
-		}
-		if field != "result" && field != "preview" {
-			return nil, fmt.Errorf("unsupported --json field %q; use result, preview, or all", field)
-		}
-		if value, found := result[field]; found {
-			selected[field] = value
-		}
+	return ref
+}
+
+// capturedRefs renders a list of Revisions as their "namespace/name" references.
+func capturedRefs(revisions []artifact.Revision) string {
+	refs := make([]string, len(revisions))
+	for index, revision := range revisions {
+		refs[index] = artifact.DisplayRef(revision.Selector)
 	}
-	return selected, nil
+	return strings.Join(refs, ", ")
+}
+
+func contentAddLong(word string) string {
+	if word == "instruction" {
+		return "Capture one local Instruction set as an immutable canonical revision. The path is a directory holding an AGENTS.md index, an instructions.toml declaration, and every declared Instruction doc."
+	}
+	return "Capture one or more local Skill directories as immutable canonical revisions. Each path is a directory containing root-level SKILL.md, or a directory whose immediate subdirectories each contain one. Paths may be relative or absolute."
+}
+
+// mutationState maps a --dry-run flag to the envelope state a mutation reports.
+func mutationState(dryRun bool) string {
+	if dryRun {
+		return "planned"
+	}
+	return "applied"
 }
 
 func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
@@ -341,23 +430,21 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	root.SetVersionTemplate("brigsby {{.Version}}\n")
-	root.PersistentFlags().String("json", "", "emit provisional machine-readable JSON (for example, --json all)")
-	root.PersistentFlags().String("jq", "", "filter JSON output with a jq expression (requires --json)")
+	root.PersistentFlags().String("jq", "", "filter the JSON result with a jq expression")
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print the Brigsby version",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			_, err := fmt.Fprintf(command.OutOrStdout(), "brigsby %s\n", resolveVersion())
-			return err
+			return emitResult(command.OutOrStdout(), "version", "clean", map[string]any{"version": resolveVersion()})
 		},
 	})
 	root.AddCommand(newHarnessCommand())
-	root.AddCommand(newArtifactCommand())
+	root.AddCommand(newContentCommand("skill", artifact.KindSkill))
+	root.AddCommand(newContentCommand("instruction", artifact.KindInstruction))
 	root.AddCommand(newNamespaceCommand())
 	root.AddCommand(newPackageCommand())
 	root.AddCommand(newRecoveryCommand())
-	root.AddCommand(newAddRootAlias())
 	root.AddCommand(newStatusRootAlias())
 	root.AddCommand(newSyncRootAlias())
 	return root
@@ -374,9 +461,6 @@ func newRootAlias(name string, target []string, short string, configure func(*co
 			if configure != nil {
 				configure(command, &aliasedArguments)
 			}
-			if jsonFields, _ := command.Root().PersistentFlags().GetString("json"); jsonFields != "" {
-				aliasedArguments = append(aliasedArguments, "--json", jsonFields)
-			}
 			aliased.SetArgs(aliasedArguments)
 			return aliased.Execute()
 		},
@@ -384,86 +468,90 @@ func newRootAlias(name string, target []string, short string, configure func(*co
 	return alias
 }
 
-func newAddRootAlias() *cobra.Command {
-	var namespace, name, kind string
-	alias := newRootAlias("add <path>", []string{"artifact", "add"}, "Capture a local Artifact directory as an immutable canonical revision.", func(command *cobra.Command, arguments *[]string) {
-		for _, flag := range []struct{ name, value string }{{"namespace", namespace}, {"name", name}, {"kind", kind}} {
-			if command.Flags().Changed(flag.name) {
-				*arguments = append(*arguments, "--"+flag.name, flag.value)
-			}
-		}
-	})
-	alias.Long = "Capture a local Artifact directory as an immutable canonical revision. A Skill path must be a directory containing SKILL.md."
-	alias.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
-	alias.Flags().StringVar(&name, "name", "", "canonical Artifact name")
-	alias.Flags().StringVar(&kind, "kind", "skills", "Artifact kind: skills or instructions")
-	return alias
-}
-
 func newStatusRootAlias() *cobra.Command {
 	var harnessID string
+	var managed bool
 	alias := newRootAlias("status", []string{"harness", "status"}, "Report linked Harness state.", func(command *cobra.Command, arguments *[]string) {
 		if command.Flags().Changed("harness") {
 			*arguments = append(*arguments, "--harness", harnessID)
 		}
+		if managed {
+			*arguments = append(*arguments, "--managed")
+		}
 	})
 	alias.Flags().StringVar(&harnessID, "harness", "", "filter by linked Harness installation ID")
+	alias.Flags().BoolVar(&managed, "managed", false, "report only managed Projections and Drift; omit Unowned paths")
 	return alias
 }
 
 func newSyncRootAlias() *cobra.Command {
-	var harnessIDs, selectors []string
-	var expect string
+	var harnessIDs, skills, instructions []string
 	var force, dryRun bool
-	alias := newRootAlias("sync", []string{"harness", "sync"}, "Safely project selected canonical Skills to linked Harnesses.", func(command *cobra.Command, arguments *[]string) {
+	alias := newRootAlias("sync", []string{"harness", "sync"}, "Safely project selected canonical content to linked Harnesses.", func(command *cobra.Command, arguments *[]string) {
 		for _, value := range harnessIDs {
 			*arguments = append(*arguments, "--harness", value)
 		}
-		for _, value := range selectors {
-			*arguments = append(*arguments, "--artifact", value)
+		for _, value := range skills {
+			*arguments = append(*arguments, "--skill", value)
+		}
+		for _, value := range instructions {
+			*arguments = append(*arguments, "--instruction", value)
 		}
 		if force {
 			*arguments = append(*arguments, "--force")
-		}
-		if command.Flags().Changed("expect") {
-			*arguments = append(*arguments, "--expect", expect)
 		}
 		if dryRun {
 			*arguments = append(*arguments, "--dry-run")
 		}
 	})
-	alias.Flags().StringSliceVar(&harnessIDs, "harness", nil, "linked Harness installation ID (repeatable)")
-	alias.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Skill selector (repeatable)")
-	alias.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
-	alias.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
+	alias.Flags().StringArrayVar(&harnessIDs, "harness", nil, "linked Harness installation ID (repeatable)")
+	alias.Flags().StringArrayVar(&skills, "skill", nil, "selected Skill reference namespace/name (repeatable)")
+	alias.Flags().StringArrayVar(&instructions, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
+	alias.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
 	alias.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
 	return alias
 }
 
 func newPackageCommand() *cobra.Command {
-	packageCommand := &cobra.Command{Use: "package", Short: "Create and inspect portable text-only Packages.", Long: "Create and inspect portable text-only Packages. Artifact selectors use namespace/kind/name, for example main/skills/release-notes."}
+	packageCommand := &cobra.Command{Use: "package", Short: "Create and inspect portable text-only Packages.", Long: "Create and inspect portable text-only Packages. In v1 a Package carries Skills only; name them with --skill namespace/name."}
 	var output, expect string
 	var replace bool
+	var skillRefs []string
 	create := &cobra.Command{
-		Use:   "create <artifact-selector>...",
+		Use:   "create --skill <namespace/name> --output <new-path>",
 		Short: "Create a portable Package from selected Skills.",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if output == "" {
 				return domainErrorf("package create requires --output <absolute-path>")
+			}
+			if len(skillRefs) == 0 {
+				return domainErrorf("package create requires at least one --skill <namespace/name>")
+			}
+			keys := make([]string, 0, len(skillRefs))
+			for _, ref := range skillRefs {
+				key, err := artifact.Key(artifact.KindSkill, ref)
+				if err != nil {
+					return asDomainError(err)
+				}
+				keys = append(keys, key)
 			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
-			result, err := portable.Create(root, arguments, output, replace, expect)
+			result, err := portable.Create(root, keys, output, replace, expect)
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "PACKAGE %s artifacts=%d output=%s\n", result.Digest, len(result.Artifacts), output)
-			return err
+			return emitResult(command.OutOrStdout(), "package create", "applied", map[string]any{
+				"digest": result.Digest,
+				"skills": len(result.Artifacts),
+				"output": output,
+			})
 		},
 	}
+	create.Flags().StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
 	create.Flags().StringVar(&output, "output", "", "absolute output archive path")
 	create.Flags().BoolVar(&replace, "replace", false, "replace an existing output guarded by --expect")
 	create.Flags().StringVar(&expect, "expect", "", "expected existing-output fingerprint")
@@ -478,25 +566,14 @@ func newPackageCommand() *cobra.Command {
 			if err != nil {
 				return asDomainError(err)
 			}
-			jsonFields, err := command.Root().PersistentFlags().GetString("json")
-			if err != nil {
-				return err
-			}
-			if jsonFields != "" {
-				return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
-					"command": "package inspect", "state": "clean", "problems": []any{},
-					"result": map[string]any{"digest": result.Digest, "artifacts": result.Artifacts},
-				})
-			}
-			if _, err := fmt.Fprintf(command.OutOrStdout(), "PACKAGE %s artifacts=%d\n", result.Digest, len(result.Artifacts)); err != nil {
-				return err
-			}
+			skills := make([]map[string]any, 0, len(result.Artifacts))
 			for _, revision := range result.Artifacts {
-				if _, err := fmt.Fprintf(command.OutOrStdout(), "ARTIFACT %s %s\n", revision.Selector, revision.Digest); err != nil {
-					return err
-				}
+				skills = append(skills, contentRef(revision.Selector, revision.Digest))
 			}
-			return nil
+			return emitResult(command.OutOrStdout(), "package inspect", "clean", map[string]any{
+				"digest": result.Digest,
+				"skills": skills,
+			})
 		},
 	}
 	inspect.Flags().StringVar(&expectedDigest, "expect-digest", "", "expected Package digest")
@@ -510,28 +587,19 @@ func newPackageCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			importArtifact := portable.Import
 			if importDryRun {
-				revisions, err := portable.CheckImport(root, arguments[0], namespace)
-				if err != nil {
-					return asDomainError(err)
-				}
-				for _, revision := range revisions {
-					if _, err := fmt.Fprintf(command.OutOrStdout(), "PLANNED import %s %s\n", revision.Selector, revision.Digest); err != nil {
-						return err
-					}
-				}
-				return nil
+				importArtifact = portable.CheckImport
 			}
-			revisions, err := portable.Import(root, arguments[0], namespace)
+			revisions, err := importArtifact(root, arguments[0], namespace)
 			if err != nil {
 				return asDomainError(err)
 			}
+			imported := make([]map[string]any, 0, len(revisions))
 			for _, revision := range revisions {
-				if _, err := fmt.Fprintf(command.OutOrStdout(), "IMPORTED %s %s\n", revision.Selector, revision.Digest); err != nil {
-					return err
-				}
+				imported = append(imported, contentRef(revision.Selector, revision.Digest))
 			}
-			return nil
+			return emitResult(command.OutOrStdout(), "package import", mutationState(importDryRun), map[string]any{"imported": imported})
 		},
 	}
 	importCommand.Flags().StringVar(&namespace, "namespace", "", "isolated destination Namespace")
@@ -551,19 +619,17 @@ func newNamespaceCommand() *cobra.Command {
 			if err := artifact.ValidatePrefix(arguments[0], arguments[1]); err != nil {
 				return err
 			}
-			if dryRun {
-				_, err := fmt.Fprintf(command.OutOrStdout(), "PLANNED prefix %s %s\n", arguments[0], arguments[1])
-				return err
+			result := map[string]any{"namespace": arguments[0], "prefix": arguments[1]}
+			if !dryRun {
+				root, err := brigsbyHome()
+				if err != nil {
+					return err
+				}
+				if err := artifact.NewStore(root).SetPrefix(arguments[0], arguments[1]); err != nil {
+					return fmt.Errorf("set Namespace prefix: %w", err)
+				}
 			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			if err := artifact.NewStore(root).SetPrefix(arguments[0], arguments[1]); err != nil {
-				return fmt.Errorf("set Namespace prefix: %w", err)
-			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "PREFIX %s %s\n", arguments[0], arguments[1])
-			return err
+			return emitResult(command.OutOrStdout(), "namespace set-prefix", mutationState(dryRun), result)
 		},
 	}
 	setPrefix.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
@@ -593,12 +659,15 @@ func newRecoveryCommand() *cobra.Command {
 			if limit > 0 && len(records) > limit {
 				records = records[:limit]
 			}
+			operations := make([]map[string]any, 0, len(records))
 			for _, record := range records {
-				if _, err := fmt.Fprintf(command.OutOrStdout(), "RECOVERY %s %s %s\n", record.ID, record.State, record.Target); err != nil {
-					return err
-				}
+				operations = append(operations, map[string]any{
+					"id":     record.ID,
+					"state":  record.State,
+					"target": record.Target,
+				})
 			}
-			return nil
+			return emitResult(command.OutOrStdout(), "recovery list", "clean", map[string]any{"operations": operations})
 		},
 	}
 	list.Flags().IntVar(&limit, "limit", 0, "maximum operations to list")
@@ -616,8 +685,15 @@ func newRecoveryCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("show Recovery operation: %w", err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "RECOVERY %s\nstate=%s\ntarget=%s\ntarget_fingerprint=%s\nreplacement_fingerprint=%s\n", record.ID, record.State, record.Target, record.TargetFingerprint, record.ReplacementFingerprint)
-			return err
+			return emitResult(command.OutOrStdout(), "recovery show", "clean", map[string]any{
+				"operation": map[string]any{
+					"id":                      record.ID,
+					"state":                   record.State,
+					"target":                  record.Target,
+					"target_fingerprint":      record.TargetFingerprint,
+					"replacement_fingerprint": record.ReplacementFingerprint,
+				},
+			})
 		},
 	})
 	var restoreExpect string
@@ -643,9 +719,9 @@ func newRecoveryCommand() *cobra.Command {
 			if restoreExpect != "" && restoreExpect != current {
 				return fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", current)
 			}
+			restored := map[string]any{"recovery_id": arguments[0], "target": record.Target}
 			if restoreDryRun {
-				_, err = fmt.Fprintf(command.OutOrStdout(), "PLANNED restore %s target=%s\n", record.ID, record.Target)
-				return err
+				return emitResult(command.OutOrStdout(), "recovery restore", "planned", map[string]any{"restored": restored})
 			}
 			operation, err := service.Restore(arguments[0])
 			if err != nil {
@@ -654,8 +730,8 @@ func newRecoveryCommand() *cobra.Command {
 			if err := harness.NewRegistry(root).ForgetProjection(record.Target); err != nil {
 				return fmt.Errorf("forget Projection: %w", err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "RESTORED %s recovery=%s\n", arguments[0], operation.ID)
-			return err
+			restored["operation_id"] = operation.ID
+			return emitResult(command.OutOrStdout(), "recovery restore", "applied", map[string]any{"restored": restored})
 		},
 	}
 	restore.Flags().StringVar(&restoreExpect, "expect", "", "expected current target fingerprint")
@@ -664,21 +740,34 @@ func newRecoveryCommand() *cobra.Command {
 	return recoveryCommand
 }
 
-func newArtifactCommand() *cobra.Command {
-	artifactCommand := &cobra.Command{
-		Use:   "artifact",
-		Short: "Capture and inspect canonical Artifacts.",
-		Long:  "Capture and inspect canonical Artifacts. An Artifact selector is namespace/kind/name, for example main/skills/release-notes.",
+// newContentCommand builds the `skill` or `instruction` command group. word is
+// the Caller-facing singular ("skill"/"instruction"); kind is the internal
+// artifact kind. The two groups carry the same verbs; only `add`'s arity and a
+// few help strings differ.
+func newContentCommand(word, kind string) *cobra.Command {
+	plural := word + "s"
+	titlePlural := strings.ToUpper(word[:1]) + word[1:] + "s"
+	group := &cobra.Command{
+		Use:   word,
+		Short: fmt.Sprintf("Capture and inspect canonical %s.", titlePlural),
+		Long:  fmt.Sprintf("Capture and inspect canonical %s. A reference is namespace/name, for example main/release-notes; the default namespace is main.", titlePlural),
 	}
-	var namespace, name, kind string
+
+	var namespace, name string
+	addArgs := cobra.MinimumNArgs(1)
+	addUse := "add <path>..."
+	if kind == artifact.KindInstruction {
+		addArgs = cobra.ExactArgs(1)
+		addUse = "add <path>"
+	}
 	add := &cobra.Command{
-		Use:   "add <path>",
-		Short: "Capture a local Artifact as an immutable canonical revision.",
-		Long:  "Capture a local Artifact as an immutable canonical revision. A Skill path must be a directory containing SKILL.md.",
-		Args:  cobra.ExactArgs(1),
+		Use:   addUse,
+		Short: fmt.Sprintf("Capture one or more local %s as immutable canonical revisions.", titlePlural),
+		Long:  contentAddLong(word),
+		Args:  addArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			if kind != "skills" && kind != "instructions" {
-				return domainErrorf("unsupported Artifact kind %q", kind)
+			if command.Flags().Changed("name") && len(arguments) != 1 {
+				return domainErrorf("--name cannot rename %d sources at once; add them one path at a time", len(arguments))
 			}
 			root, err := brigsbyHome()
 			if err != nil {
@@ -686,159 +775,206 @@ func newArtifactCommand() *cobra.Command {
 			}
 			store := artifact.NewStore(root)
 			options := artifact.CaptureOptions{Namespace: namespace, Name: name, ExplicitName: command.Flags().Changed("name")}
-			var revision artifact.Revision
-			if kind == "instructions" {
-				revision, err = store.CaptureInstructions(arguments[0], options)
-			} else {
-				revision, err = store.CaptureSkill(arguments[0], options)
+
+			if kind == artifact.KindInstruction {
+				revision, err := store.CaptureInstructions(arguments[0], options)
+				if err != nil {
+					return domainErrorf("capture %s %s: %w", word, arguments[0], err)
+				}
+				return emitResult(command.OutOrStdout(), word+" add", "applied", map[string]any{
+					"revisions": []map[string]any{contentRef(revision.Selector, revision.Digest)},
+				})
 			}
+
+			sources, err := expandSkillSources(arguments)
 			if err != nil {
-				return domainErrorf("capture Artifact: %w", err)
+				return asDomainError(err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "CAPTURED %s %s\n", revision.Selector, revision.Digest)
-			return err
+			if len(sources) > 1 && command.Flags().Changed("name") {
+				return domainErrorf("--name cannot rename %d Skills at once; add them one path at a time", len(sources))
+			}
+			captured := make([]artifact.Revision, 0, len(sources))
+			for _, source := range sources {
+				revision, err := store.CaptureSkill(source, options)
+				if err != nil {
+					if len(captured) > 0 {
+						return domainErrorf("capture %s %s (after capturing %s): %w", word, source, capturedRefs(captured), err)
+					}
+					return domainErrorf("capture %s %s: %w", word, source, err)
+				}
+				captured = append(captured, revision)
+			}
+			noteUntrackedSources(command, root, captured, sources)
+			revisions := make([]map[string]any, 0, len(captured))
+			for _, revision := range captured {
+				revisions = append(revisions, contentRef(revision.Selector, revision.Digest))
+			}
+			return emitResult(command.OutOrStdout(), word+" add", "applied", map[string]any{"revisions": revisions})
 		},
 	}
 	add.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
-	add.Flags().StringVar(&name, "name", "", "canonical Artifact name")
-	add.Flags().StringVar(&kind, "kind", "skills", "Artifact kind: skills or instructions")
-	artifactCommand.AddCommand(add)
-	var listNamespace, listKind string
+	add.Flags().StringVar(&name, "name", "", fmt.Sprintf("canonical %s name (single source only)", word))
+	group.AddCommand(add)
+
+	var listNamespace string
 	list := &cobra.Command{
 		Use:   "list",
-		Short: "List canonical Artifacts and their selected Revisions.",
+		Short: fmt.Sprintf("List canonical %s and their selected Revisions.", titlePlural),
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
-			revisions, err := artifact.NewStore(root).List(artifact.ListOptions{Namespace: listNamespace, Kind: listKind})
+			revisions, err := artifact.NewStore(root).List(artifact.ListOptions{Namespace: listNamespace, Kind: kind})
 			if err != nil {
-				return fmt.Errorf("list Artifacts: %w", err)
+				return fmt.Errorf("list %s: %w", plural, err)
 			}
+			entries := make([]map[string]any, 0, len(revisions))
 			for _, revision := range revisions {
-				if _, err := fmt.Fprintf(command.OutOrStdout(), "ARTIFACT %s %s\n", revision.Selector, revision.Digest); err != nil {
-					return err
-				}
+				entries = append(entries, contentRef(revision.Selector, revision.Digest))
 			}
-			return nil
+			return emitResult(command.OutOrStdout(), word+" list", "clean", map[string]any{plural: entries})
 		},
 	}
 	list.Flags().StringVar(&listNamespace, "namespace", "", "filter by Namespace")
-	list.Flags().StringVar(&listKind, "kind", "", "filter by Artifact kind")
-	artifactCommand.AddCommand(list)
+	group.AddCommand(list)
+
 	var selectRevision string
 	var selectDryRun bool
 	selectCommand := &cobra.Command{
-		Use:   "select <namespace/kind/name>",
-		Short: "Select an already stored Artifact Revision.",
-		Long:  "Select an already stored Artifact Revision. The selector is namespace/kind/name, for example main/skills/release-notes.",
+		Use:   "select <namespace/name>",
+		Short: fmt.Sprintf("Select an already stored %s Revision.", word),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
 			if selectRevision == "" {
 				return domainErrorf("select requires --revision sha256-<hex>")
 			}
+			key, err := artifact.Key(kind, arguments[0])
+			if err != nil {
+				return asDomainError(err)
+			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
 			store := artifact.NewStore(root)
+			resolve := store.Select
 			if selectDryRun {
-				revision, err := store.VerifyRevision(arguments[0], selectRevision)
-				if err != nil {
-					return fmt.Errorf("select Artifact: %w", err)
-				}
-				_, err = fmt.Fprintf(command.OutOrStdout(), "PLANNED select %s %s\n", revision.Selector, revision.Digest)
-				return err
+				resolve = store.VerifyRevision
 			}
-			revision, err := store.Select(arguments[0], selectRevision)
+			revision, err := resolve(key, selectRevision)
 			if err != nil {
-				return fmt.Errorf("select Artifact: %w", err)
+				return fmt.Errorf("select %s: %w", word, err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s\n", revision.Selector, revision.Digest)
-			return err
+			return emitResult(command.OutOrStdout(), word+" select", mutationState(selectDryRun), map[string]any{
+				"selected": contentRef(revision.Selector, revision.Digest),
+			})
 		},
 	}
 	selectCommand.Flags().StringVar(&selectRevision, "revision", "", "stored Revision digest")
 	selectCommand.Flags().BoolVar(&selectDryRun, "dry-run", false, "preview without writing")
-	artifactCommand.AddCommand(selectCommand)
+	group.AddCommand(selectCommand)
+
 	var promoteRevision string
 	var promoteDryRun bool
 	promote := &cobra.Command{
-		Use: "promote <namespace/kind/name>", Short: "Promote one imported Artifact Revision to main.", Long: "Promote one imported Artifact Revision to main. The selector is namespace/kind/name, for example friend/skills/release-notes.", Args: cobra.ExactArgs(1),
+		Use:   "promote <namespace/name>",
+		Short: fmt.Sprintf("Promote one imported %s Revision to main.", word),
+		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
-			if promoteRevision == "" {
-				return domainErrorf("promote requires --revision sha256-<hex>")
+			key, err := artifact.Key(kind, arguments[0])
+			if err != nil {
+				return asDomainError(err)
 			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
 			store := artifact.NewStore(root)
-			if promoteDryRun {
-				revision, err := store.VerifyRevision(arguments[0], promoteRevision)
+			revisionDigest := promoteRevision
+			if revisionDigest == "" {
+				revisionDigest, err = soleRevision(store, key)
 				if err != nil {
-					return fmt.Errorf("promote Artifact: %w", err)
+					return err
 				}
-				_, err = fmt.Fprintf(command.OutOrStdout(), "PLANNED promote main/skills/%s %s origin=%s\n", strings.Split(arguments[0], "/")[2], revision.Digest, revision.Selector)
-				return err
 			}
-			revision, err := store.Promote(arguments[0], promoteRevision)
+			resolve := store.Promote
+			if promoteDryRun {
+				resolve = store.VerifyRevision
+			}
+			revision, err := resolve(key, revisionDigest)
 			if err != nil {
-				return fmt.Errorf("promote Artifact: %w", err)
+				return fmt.Errorf("promote %s: %w", word, err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "PROMOTED %s %s origin=%s@%s\n", revision.Selector, revision.Digest, arguments[0], revision.Digest)
-			return err
+			return emitResult(command.OutOrStdout(), word+" promote", mutationState(promoteDryRun), map[string]any{
+				"promoted": map[string]any{
+					"kind":   word,
+					"ref":    "main/" + refName(arguments[0]),
+					"digest": revision.Digest,
+					"origin": map[string]any{"ref": artifact.DisplayRef(key), "revision": revision.Digest},
+				},
+			})
 		},
 	}
 	promote.Flags().StringVar(&promoteRevision, "revision", "", "imported Revision digest")
 	promote.Flags().BoolVar(&promoteDryRun, "dry-run", false, "preview without writing")
-	artifactCommand.AddCommand(promote)
+	group.AddCommand(promote)
+
 	var showFiles bool
 	show := &cobra.Command{
-		Use:   "show <namespace/kind/name>",
-		Short: "Show metadata for the selected canonical Artifact revision.",
-		Long:  "Show metadata for the selected canonical Artifact revision. Pass --files to print the selected canonical text files.",
+		Use:   "show <namespace/name>",
+		Short: fmt.Sprintf("Show metadata for the selected canonical %s revision.", word),
+		Long:  fmt.Sprintf("Show metadata for the selected canonical %s revision. Pass --files to print the selected canonical text files.", word),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
+			key, err := artifact.Key(kind, arguments[0])
+			if err != nil {
+				return asDomainError(err)
+			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
 			}
 			store := artifact.NewStore(root)
-			revision, err := store.Selected(arguments[0])
+			revision, err := store.Selected(key)
 			if err != nil {
-				return fmt.Errorf("show Artifact: %w", err)
+				return fmt.Errorf("show %s: %w", word, err)
 			}
-			origin, err := store.Origin(arguments[0])
+			origin, err := store.Origin(key)
 			if err != nil {
-				return fmt.Errorf("show Artifact origin: %w", err)
+				return fmt.Errorf("show %s origin: %w", word, err)
 			}
+			revisionResult := contentRef(revision.Selector, revision.Digest)
 			if origin.Selector != "" {
-				if _, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s origin=%s@%s\n", revision.Selector, revision.Digest, origin.Selector, origin.Revision); err != nil {
-					return err
+				revisionResult["origin"] = map[string]any{"ref": artifact.DisplayRef(origin.Selector), "revision": origin.Revision}
+			}
+			result := map[string]any{"revision": revisionResult}
+			if showFiles {
+				_, filesPath, err := store.SelectedContentFilesPath(key)
+				if err != nil {
+					return fmt.Errorf("show %s files: %w", word, err)
 				}
-			} else if _, err = fmt.Fprintf(command.OutOrStdout(), "SELECTED %s %s\n", revision.Selector, revision.Digest); err != nil {
-				return err
+				files, err := artifactFiles(filesPath)
+				if err != nil {
+					return fmt.Errorf("read %s files: %w", word, err)
+				}
+				result["files"] = files
 			}
-			if !showFiles {
-				return nil
-			}
-			_, filesPath, err := store.SelectedFilesPath(arguments[0])
-			if err != nil {
-				return fmt.Errorf("show Artifact files: %w", err)
-			}
-			return writeArtifactFiles(command.OutOrStdout(), filesPath)
+			return emitResult(command.OutOrStdout(), word+" show", "clean", result)
 		},
 	}
 	show.Flags().BoolVar(&showFiles, "files", false, "print selected canonical text files")
-	artifactCommand.AddCommand(show)
-	return artifactCommand
+	group.AddCommand(show)
+	return group
 }
 
-func writeArtifactFiles(output io.Writer, root string) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+// artifactFiles reads the selected Revision's runtime tree into sorted
+// {bytes, contents, path} objects. filepath.WalkDir visits lexically, so the
+// slice is already ordered by path.
+func artifactFiles(root string) ([]map[string]any, error) {
+	files := []map[string]any{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -853,9 +989,14 @@ func writeArtifactFiles(output io.Writer, root string) error {
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(output, "FILE %s bytes=%d\n%s\n---\n", filepath.ToSlash(relative), len(contents), contents)
-		return err
+		files = append(files, map[string]any{
+			"path":     filepath.ToSlash(relative),
+			"bytes":    len(contents),
+			"contents": string(contents),
+		})
+		return nil
 	})
+	return files, err
 }
 
 func newHarnessCommand() *cobra.Command {
@@ -869,11 +1010,12 @@ func newHarnessCommand() *cobra.Command {
 		Short: "Discover supported user-level Harness installations.",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverPersonalCandidates()
+			candidates, err := discoverBuiltinCandidates()
 			if err != nil {
 				return err
 			}
 			matched := false
+			found := []map[string]any{}
 			for _, candidate := range candidates {
 				if harnessName != "" && candidate.candidate.Name != harnessName {
 					continue
@@ -882,14 +1024,16 @@ func newHarnessCommand() *cobra.Command {
 				if !candidate.found {
 					continue
 				}
-				if _, err := fmt.Fprintf(command.OutOrStdout(), "CANDIDATE %s %s %s\n", candidate.candidate.ID, candidate.candidate.Name, candidate.candidate.SkillsPath); err != nil {
-					return err
-				}
+				found = append(found, map[string]any{
+					"id":          candidate.candidate.ID,
+					"harness":     candidate.candidate.Name,
+					"skills_path": candidate.candidate.SkillsPath,
+				})
 			}
 			if harnessName != "" && !matched {
 				return fmt.Errorf("unsupported harness %q", harnessName)
 			}
-			return nil
+			return emitResult(command.OutOrStdout(), "harness discover", "clean", map[string]any{"candidates": found})
 		},
 	}
 	discover.Flags().StringVar(&harnessName, "harness", "", "filter by supported Harness")
@@ -899,7 +1043,7 @@ func newHarnessCommand() *cobra.Command {
 		Short: "Link a discovered Harness installation.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverPersonalCandidates()
+			candidates, err := discoverBuiltinCandidates()
 			if err != nil {
 				return err
 			}
@@ -925,8 +1069,12 @@ func newHarnessCommand() *cobra.Command {
 			if err := harness.NewRegistry(root).Link(candidate.candidate); err != nil {
 				return fmt.Errorf("link Harness: %w", err)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "LINKED %s %s\n", candidate.candidate.ID, candidate.candidate.SkillsPath)
-			return err
+			return emitResult(command.OutOrStdout(), "harness link", "applied", map[string]any{
+				"linked": map[string]any{
+					"id":          candidate.candidate.ID,
+					"skills_path": candidate.candidate.SkillsPath,
+				},
+			})
 		},
 	})
 	var unlinkDryRun bool
@@ -954,29 +1102,23 @@ func newHarnessCommand() *cobra.Command {
 			if !found {
 				return fmt.Errorf("linked Harness %q was not found", arguments[0])
 			}
-			if unlinkDryRun {
-				_, err = fmt.Fprintf(command.OutOrStdout(), "PLANNED unlink %s\n", arguments[0])
-				return err
+			if !unlinkDryRun {
+				if err := registry.Unlink(arguments[0]); err != nil {
+					return fmt.Errorf("unlink Harness: %w", err)
+				}
 			}
-			if err := registry.Unlink(arguments[0]); err != nil {
-				return fmt.Errorf("unlink Harness: %w", err)
-			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "UNLINKED %s\n", arguments[0])
-			return err
+			return emitResult(command.OutOrStdout(), "harness unlink", mutationState(unlinkDryRun), map[string]any{"unlinked": arguments[0]})
 		},
 	}
 	unlink.Flags().BoolVar(&unlinkDryRun, "dry-run", false, "preview without writing")
 	harnessCommand.AddCommand(unlink)
 	var statusHarness string
+	var statusManaged bool
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "Show linked Harness Projections, Drift, and Unowned paths.",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
-			jsonFields, err := command.Root().PersistentFlags().GetString("json")
-			if err != nil {
-				return err
-			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
@@ -1002,29 +1144,18 @@ func newHarnessCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("read Projections: %w", err)
 			}
-			jsonMode := jsonFields != ""
-			if len(linked) == 0 {
-				if jsonMode {
-					return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
-						"command": "harness status", "state": "clean", "problems": []any{},
-					})
-				}
-				_, err := fmt.Fprintln(command.OutOrStdout(), "No linked Harnesses.")
-				return err
-			}
-			var jsonProblems []map[string]any
+
+			linkedResult := []map[string]any{}
+			projectionResult := []map[string]any{}
+			problems := []map[string]any{}
 			driftCount, staleCount, unownedCount := 0, 0, 0
-			write := func(format string, args ...any) error {
-				if jsonMode {
-					return nil
-				}
-				_, err := fmt.Fprintf(command.OutOrStdout(), format, args...)
-				return err
-			}
+
 			for _, candidate := range linked {
-				if err := write("LINKED %s %s %s\n", candidate.ID, candidate.Name, candidate.SkillsPath); err != nil {
-					return err
-				}
+				linkedResult = append(linkedResult, map[string]any{
+					"id":          candidate.ID,
+					"harness":     candidate.Name,
+					"skills_path": candidate.SkillsPath,
+				})
 				owned := map[string]struct{}{}
 				for _, projection := range projections {
 					if projection.HarnessID != candidate.ID {
@@ -1039,33 +1170,37 @@ func newHarnessCommand() *cobra.Command {
 					if err != nil && !os.IsNotExist(err) {
 						return fmt.Errorf("read selected Artifact: %w", err)
 					}
-					if err == nil && matches {
-						if selected.Digest == projection.Revision {
-							if err := write("PROJECTION %s %s %s\n", projection.Artifact, projection.Revision, projection.Path); err != nil {
-								return err
-							}
-							continue
-						}
+					entry := map[string]any{
+						"harness":  candidate.ID,
+						"kind":     kindWord(projection.Artifact),
+						"ref":      artifact.DisplayRef(projection.Artifact),
+						"revision": projection.Revision,
+						"path":     projection.Path,
+					}
+					switch {
+					case err == nil && matches && selected.Digest == projection.Revision:
+						entry["status"] = "projected"
+					case err == nil && matches:
 						staleCount++
-						jsonProblems = append(jsonProblems, map[string]any{
+						entry["status"] = "stale"
+						problems = append(problems, map[string]any{
 							"id":      fmt.Sprintf("stale-%02d", staleCount),
 							"code":    "projection_stale",
-							"message": fmt.Sprintf("Stale Projection %s %s", projection.Artifact, projection.Path),
+							"message": fmt.Sprintf("Stale Projection %s %s", displayContent(projection.Artifact), projection.Path),
 						})
-						if err := write("STALE %s %s\n", projection.Artifact, projection.Path); err != nil {
-							return err
-						}
-						continue
+					default:
+						driftCount++
+						entry["status"] = "drift"
+						problems = append(problems, map[string]any{
+							"id":      fmt.Sprintf("drift-%02d", driftCount),
+							"code":    "projection_drift",
+							"message": fmt.Sprintf("Drift %s %s", displayContent(projection.Artifact), projection.Path),
+						})
 					}
-					driftCount++
-					jsonProblems = append(jsonProblems, map[string]any{
-						"id":      fmt.Sprintf("drift-%02d", driftCount),
-						"code":    "projection_drift",
-						"message": fmt.Sprintf("Drift %s %s", projection.Artifact, projection.Path),
-					})
-					if err := write("DRIFT %s %s\n", projection.Artifact, projection.Path); err != nil {
-						return err
-					}
+					projectionResult = append(projectionResult, entry)
+				}
+				if statusManaged {
+					continue
 				}
 				unowned, err := unownedSkills(candidate.SkillsPath, owned)
 				if err != nil {
@@ -1073,49 +1208,39 @@ func newHarnessCommand() *cobra.Command {
 				}
 				for _, path := range unowned {
 					unownedCount++
-					jsonProblems = append(jsonProblems, map[string]any{
+					problems = append(problems, map[string]any{
 						"id":      fmt.Sprintf("unowned-%02d", unownedCount),
 						"code":    "unowned_path",
 						"message": fmt.Sprintf("Unowned path %s", path),
 					})
-					if err := write("UNOWNED %s\n", path); err != nil {
-						return err
-					}
 				}
 			}
-			if jsonMode {
-				state := "clean"
-				if driftCount > 0 {
-					state = "drifted"
-				} else if staleCount > 0 {
-					state = "stale"
-				} else if unownedCount > 0 {
-					state = "unowned"
-				}
-				if jsonProblems == nil {
-					jsonProblems = []map[string]any{}
-				}
-				if err := json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
-					"command":  "harness status",
-					"state":    state,
-					"problems": jsonProblems,
-				}); err != nil {
-					return err
-				}
+
+			state := "clean"
+			switch {
+			case driftCount > 0:
+				state = "drifted"
+			case staleCount > 0:
+				state = "stale"
+			case unownedCount > 0:
+				state = "unowned"
 			}
-			return nil
+			return emitEnvelope(command.OutOrStdout(), "harness status", state, problems, map[string]any{
+				"linked":      linkedResult,
+				"projections": projectionResult,
+			})
 		},
 	}
 	status.Flags().StringVar(&statusHarness, "harness", "", "filter by linked Harness installation ID")
+	status.Flags().BoolVar(&statusManaged, "managed", false, "report only managed Projections and Drift; omit Unowned paths")
 	harnessCommand.AddCommand(status)
-	var linkedIDs, selectors []string
-	var expect string
+	var linkedIDs, skillRefs, instructionRefs []string
 	var force, dryRun bool
 	sync := &cobra.Command{
-		Use:   "sync [artifact-selector...]",
-		Short: "Safely project selected canonical Skills to linked Harnesses.",
-		Long:  "Safely project selected canonical Skills to linked Harnesses. Artifact selectors use namespace/kind/name, for example main/skills/release-notes.",
-		Args:  cobra.ArbitraryArgs,
+		Use:   "sync",
+		Short: "Safely project selected canonical content to linked Harnesses.",
+		Long:  "Safely project selected canonical content to linked Harnesses. Select with --skill namespace/name and --instruction namespace/name; with neither, every selection in main is projected.",
+		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
 			root, err := brigsbyHome()
 			if err != nil {
@@ -1126,8 +1251,20 @@ func newHarnessCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("read linked Harnesses: %w", err)
 			}
-			selectors = append(selectors, arguments...)
-			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force, expect)
+			var selectors []string
+			for _, group := range []struct {
+				kind string
+				refs []string
+			}{{artifact.KindSkill, skillRefs}, {artifact.KindInstruction, instructionRefs}} {
+				for _, ref := range group.refs {
+					key, err := artifact.Key(group.kind, ref)
+					if err != nil {
+						return asDomainError(err)
+					}
+					selectors = append(selectors, key)
+				}
+			}
+			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force)
 			if err != nil {
 				return err
 			}
@@ -1169,10 +1306,10 @@ func newHarnessCommand() *cobra.Command {
 			return writeSyncResults(command, "applied", targets, operations)
 		},
 	}
-	sync.Flags().StringSliceVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
-	sync.Flags().StringSliceVar(&selectors, "artifact", nil, "selected canonical Artifact selector (repeatable; positional selectors are also accepted)")
-	sync.Flags().BoolVar(&force, "force", false, "replace one blocked target when guarded by --expect")
-	sync.Flags().StringVar(&expect, "expect", "", "expected target fingerprint from a blocked sync")
+	sync.Flags().StringArrayVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
+	sync.Flags().StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
+	sync.Flags().StringArrayVar(&instructionRefs, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
+	sync.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
 	sync.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
 	harnessCommand.AddCommand(sync)
 	return harnessCommand
@@ -1187,7 +1324,7 @@ type syncTarget struct {
 	removal  bool
 }
 
-func preflightSync(root string, registry harness.Registry, linked []harness.Candidate, requestedHarnesses, requestedArtifacts []string, force bool, expect string) (targets []syncTarget, err error) {
+func preflightSync(root string, registry harness.Registry, linked []harness.Candidate, requestedHarnesses, requestedArtifacts []string, force bool) (targets []syncTarget, err error) {
 	success := false
 	var cleanups []func()
 	defer func() {
@@ -1225,7 +1362,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 		}
 	}
 	if instructionCount > 1 {
-		return nil, fmt.Errorf("sync selects multiple global Instruction Artifacts; narrow --artifact to one so Brigsby never merges native root files")
+		return nil, fmt.Errorf("sync selects multiple global Instructions; narrow --instruction to one so Brigsby never merges native root files")
 	}
 	seenTargets := make(map[string]struct{})
 	for _, selector := range requestedArtifacts {
@@ -1235,7 +1372,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 				return nil, fmt.Errorf("read selected Artifact: %w", err)
 			}
 			var instructionTargets []syncTarget
-			var changed []string
+			changed := false
 			for _, targetHarness := range selectedHarnesses {
 				rendered, err := store.RenderSelectedInstructions(selector, targetHarness.Name)
 				if err != nil {
@@ -1265,16 +1402,13 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 						return nil, fmt.Errorf("fingerprint rendered Instruction content: %w", err)
 					}
 					if targetContent != "absent" && targetContent != replacementContent {
-						changed = append(changed, plan.TargetFingerprint())
+						changed = true
 					}
 					instructionTargets = append(instructionTargets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: item.target, plan: plan, cleanup: rendered.Cleanup})
 				}
 			}
-			if len(changed) > 0 {
-				expected := strings.Join(changed, ",")
-				if len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 || !force || expect != expected {
-					return nil, fmt.Errorf("BLOCKED: Instruction Projection differs from %s; rerun with --force --expect %s", renderedInstructionPaths(instructionTargets), expected)
-				}
+			if changed && (len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 || !force) {
+				return nil, fmt.Errorf("BLOCKED: Instruction Projection differs from %s; narrow --harness and --instruction to one target and rerun with --force", renderedInstructionPaths(instructionTargets))
 			}
 			targets = append(targets, instructionTargets...)
 			continue
@@ -1314,7 +1448,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 					continue
 				}
 				if len(selectedHarnesses) != 1 || len(requestedArtifacts) != 1 {
-					return nil, fmt.Errorf("BLOCKED: %s differs from %s; narrow --harness and --artifact to one target before force sync", target, rendered.Revision.Selector)
+					return nil, fmt.Errorf("BLOCKED: %s differs from %s; narrow --harness and --skill to one target before force sync", target, artifact.DisplayRef(rendered.Revision.Selector))
 				}
 				if !force {
 					kind := "Unowned path"
@@ -1324,10 +1458,7 @@ func preflightSync(root string, registry harness.Registry, linked []harness.Cand
 							break
 						}
 					}
-					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby artifact add %s --name %s' or rerun with --force --expect %s", kind, target, rendered.Revision.Selector, target, rendered.Name, plan.TargetFingerprint())
-				}
-				if expect != plan.TargetFingerprint() {
-					return nil, fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", plan.TargetFingerprint())
+					return nil, fmt.Errorf("BLOCKED: %s %s differs from %s; keep with 'brigsby skill add %s --name %s' or rerun with --force", kind, target, artifact.DisplayRef(rendered.Revision.Selector), target, rendered.Name)
 				}
 			}
 			targets = append(targets, syncTarget{harness: targetHarness, revision: rendered.Revision, path: target, plan: plan, cleanup: rendered.Cleanup})
@@ -1455,48 +1586,28 @@ func partialSyncError(operations []recovery.Operation, target syncTarget, cause 
 }
 
 func writeSyncResults(command *cobra.Command, state string, targets []syncTarget, operations []recovery.Operation) error {
-	jsonFields, err := command.Root().PersistentFlags().GetString("json")
-	if err != nil {
-		return err
-	}
-	if jsonFields != "" {
-		results := make([]map[string]string, 0, len(targets))
-		for _, target := range targets {
-			operation := "project"
-			if target.removal {
-				operation = "remove_previous_projection"
-			}
-			results = append(results, map[string]string{"harness": target.harness.ID, "artifact": target.revision.Selector, "revision": target.revision.Digest, "target": target.path, "operation": operation})
+	results := make([]map[string]any, 0, len(targets))
+	for _, target := range targets {
+		operation := "project"
+		if target.removal {
+			operation = "remove_previous_projection"
 		}
-		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{
-			"command":  "harness sync",
-			"state":    state,
-			"problems": []any{},
-			"result":   results,
-			"preview":  map[string]any{"recovery_ids": recoveryOperationIDs(operations)},
+		results = append(results, map[string]any{
+			"harness":   target.harness.ID,
+			"kind":      kindWord(target.revision.Selector),
+			"ref":       artifact.DisplayRef(target.revision.Selector),
+			"revision":  target.revision.Digest,
+			"target":    target.path,
+			"operation": operation,
 		})
 	}
-	operationIndex := 0
-	for _, target := range targets {
-		switch state {
-		case "clean":
-			_, err = fmt.Fprintf(command.OutOrStdout(), "CLEAN %s %s\n", target.revision.Selector, target.revision.Digest)
-		case "planned":
-			_, err = fmt.Fprintf(command.OutOrStdout(), "PLANNED %s %s target=%s\n", target.revision.Selector, target.revision.Digest, target.path)
-		default:
-			if !target.removal && target.plan.TargetFingerprint() == target.plan.ReplacementFingerprint() {
-				_, err = fmt.Fprintf(command.OutOrStdout(), "CLEAN %s %s\n", target.revision.Selector, target.revision.Digest)
-				break
-			}
-			recoveryID := operations[operationIndex].ID
-			operationIndex++
-			_, err = fmt.Fprintf(command.OutOrStdout(), "APPLIED %s %s recovery=%s\n", target.revision.Selector, target.revision.Digest, recoveryID)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return encodeCanonicalJSON(command.OutOrStdout(), map[string]any{
+		"command":  "harness sync",
+		"state":    state,
+		"problems": []any{},
+		"result":   results,
+		"preview":  map[string]any{"recovery_ids": recoveryOperationIDs(operations)},
+	})
 }
 
 func recoveryOperationIDs(operations []recovery.Operation) []string {
@@ -1535,12 +1646,131 @@ func unownedSkills(skillsPath string, owned map[string]struct{}) ([]string, erro
 	return paths, nil
 }
 
+// expandSkillSources resolves each add path to one or more concrete Skill
+// directories. A path that itself holds a root-level SKILL.md is one Skill; any
+// other directory contributes each immediate subdirectory that holds one, so a
+// Caller can capture a whole Harness skills tree in one command. Order follows
+// the arguments, then lexical directory order; duplicates collapse.
+func expandSkillSources(paths []string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var sources []string
+	appendSource := func(path string) {
+		if _, duplicate := seen[path]; duplicate {
+			return
+		}
+		seen[path] = struct{}{}
+		sources = append(sources, path)
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("inspect Skill source %s: %w", path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("Skill source must be a directory: %s", path)
+		}
+		if hasSkillFile(path) {
+			appendSource(filepath.Clean(path))
+			continue
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, fmt.Errorf("read Skill directory %s: %w", path, err)
+		}
+		matched := 0
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			child := filepath.Join(path, entry.Name())
+			if hasSkillFile(child) {
+				appendSource(filepath.Clean(child))
+				matched++
+			}
+		}
+		if matched == 0 {
+			return nil, fmt.Errorf("%s has no root-level SKILL.md and no immediate subdirectory containing one", path)
+		}
+	}
+	return sources, nil
+}
+
+func hasSkillFile(directory string) bool {
+	info, err := os.Stat(filepath.Join(directory, "SKILL.md"))
+	return err == nil && info.Mode().IsRegular()
+}
+
+// noteUntrackedSources tells the Caller when a freshly captured Skill source
+// lives inside a linked Harness's own skills path but is not yet a recorded
+// Projection, so `status` will not report drift against it. `add` copies into
+// canonical state; it never claims the source path. The advisory goes to
+// stderr so it never enters stdout or JSON output.
+func noteUntrackedSources(command *cobra.Command, root string, captured []artifact.Revision, sources []string) {
+	if len(captured) != len(sources) {
+		return
+	}
+	registry := harness.NewRegistry(root)
+	linked, err := registry.List()
+	if err != nil || len(linked) == 0 {
+		return
+	}
+	projections, err := registry.ListProjections()
+	if err != nil {
+		return
+	}
+	tracked := make(map[string]struct{}, len(projections))
+	for _, projection := range projections {
+		tracked[projection.Path] = struct{}{}
+	}
+	for index, source := range sources {
+		absSource, err := filepath.Abs(source)
+		if err != nil {
+			continue
+		}
+		if _, ok := tracked[absSource]; ok {
+			continue
+		}
+		for _, candidate := range linked {
+			if filepath.Dir(absSource) != filepath.Clean(candidate.SkillsPath) {
+				continue
+			}
+			fmt.Fprintf(command.ErrOrStderr(),
+				"NOTE %s sits in the %s Harness skills path but is not drift-tracked; run 'brigsby harness sync --skill %s --harness %s' to project and track it\n",
+				absSource, candidate.Name, artifact.DisplayRef(captured[index].Selector), candidate.ID)
+			break
+		}
+	}
+}
+
+// soleRevision resolves the Revision digest for a Skill or Instruction when the
+// Caller did not pass --revision. It succeeds only when exactly one Revision is
+// stored. key is the internal store key "namespace/kind/name".
+func soleRevision(store artifact.Store, key string) (string, error) {
+	namespace := strings.Split(key, "/")[0]
+	ref := artifact.DisplayRef(key)
+	digests, err := store.Revisions(key)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", domainErrorf("no stored Revisions for %s; run 'brigsby %s list --namespace %s'", ref, kindWord(key), namespace)
+		}
+		return "", fmt.Errorf("read stored Revisions: %w", err)
+	}
+	switch len(digests) {
+	case 0:
+		return "", domainErrorf("no stored Revisions for %s; run 'brigsby %s list --namespace %s'", ref, kindWord(key), namespace)
+	case 1:
+		return digests[0], nil
+	default:
+		return "", domainErrorf("%s has %d stored Revisions; pass --revision <sha256-hex> (stored: %s)", ref, len(digests), strings.Join(digests, ", "))
+	}
+}
+
 type discoveredCandidate struct {
 	candidate harness.Candidate
 	found     bool
 }
 
-func discoverPersonalCandidates() ([]discoveredCandidate, error) {
+func discoverBuiltinCandidates() ([]discoveredCandidate, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("find user home: %w", err)
@@ -1552,9 +1782,9 @@ func discoverPersonalCandidates() ([]discoveredCandidate, error) {
 		return nil, fmt.Errorf("XDG_CONFIG_HOME must be an absolute path")
 	}
 	known := []harness.Candidate{
-		{ID: "codex-personal", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".codex"))},
-		{ID: "claude-personal", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".claude"))},
-		{ID: "opencode-personal", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(configHome, "opencode"))},
+		{ID: "codex", Name: "codex", SkillsPath: filepath.Join(home, ".agents", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".codex"))},
+		{ID: "claude", Name: "claude", SkillsPath: filepath.Join(home, ".claude", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(home, ".claude"))},
+		{ID: "opencode", Name: "opencode", SkillsPath: filepath.Join(configHome, "opencode", "skills"), InstructionsPath: structuredInstructionPath(filepath.Join(configHome, "opencode"))},
 	}
 	discovered := make([]discoveredCandidate, 0, len(known))
 	for _, candidate := range known {

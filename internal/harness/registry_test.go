@@ -14,7 +14,7 @@ func TestRegistryRecordsAndListsProjections(t *testing.T) {
 	root := t.TempDir()
 	registry := harness.NewRegistry(root)
 	first := harness.Projection{
-		HarnessID:   "codex-personal",
+		HarnessID:   "codex",
 		Path:        filepath.Join(root, "skills", "release-notes"),
 		Artifact:    "main/skills/release-notes",
 		Revision:    "sha256-aaa",
@@ -46,7 +46,7 @@ func TestRegistryForgetsProjectionByPath(t *testing.T) {
 	registry := harness.NewRegistry(root)
 	path := filepath.Join(root, "skills", "release-notes")
 	if err := registry.RecordProjection(harness.Projection{
-		HarnessID:   "codex-personal",
+		HarnessID:   "codex",
 		Path:        path,
 		Artifact:    "main/skills/release-notes",
 		Revision:    "sha256-aaa",
@@ -72,7 +72,7 @@ func TestRegistryUnlinkRemovesAssociationAndProjectionClaims(t *testing.T) {
 	root := t.TempDir()
 	registry := harness.NewRegistry(root)
 	path := filepath.Join(root, "home", ".agents", "skills")
-	candidate := harness.Candidate{ID: "codex-personal", Name: "codex", SkillsPath: path}
+	candidate := harness.Candidate{ID: "codex", Name: "codex", SkillsPath: path}
 	if err := registry.Link(candidate); err != nil {
 		t.Fatalf("link: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestRegistryUnlinkRemovesAssociationAndProjectionClaims(t *testing.T) {
 		t.Fatalf("write harness file: %v", err)
 	}
 
-	if err := harness.NewRegistry(root).Unlink("codex-personal"); err != nil {
+	if err := harness.NewRegistry(root).Unlink("codex"); err != nil {
 		t.Fatalf("unlink: %v", err)
 	}
 	linked, err := harness.NewRegistry(root).List()
@@ -120,7 +120,7 @@ func TestRegistryLinksAndListsCodexInstallation(t *testing.T) {
 
 	root := t.TempDir()
 	registry := harness.NewRegistry(root)
-	candidate := harness.Candidate{ID: "codex-personal", Name: "codex", SkillsPath: filepath.Join(root, "home", ".agents", "skills")}
+	candidate := harness.Candidate{ID: "codex", Name: "codex", SkillsPath: filepath.Join(root, "home", ".agents", "skills")}
 	if err := registry.Link(candidate); err != nil {
 		t.Fatalf("link: %v", err)
 	}
