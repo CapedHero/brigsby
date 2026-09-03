@@ -46,7 +46,10 @@ func asDomainError(err error) error {
 // stateError identifies unreadable canonical state. It is distinct from a
 // request error and from projection drift: the caller did not change the
 // projected content, Brigsby's own recorded source cannot be trusted.
-type stateError struct{ err error }
+type stateError struct {
+	err     error
+	context map[string]any
+}
 
 func (err stateError) Error() string { return err.err.Error() }
 
@@ -59,6 +62,10 @@ func stateErrorf(format string, arguments ...any) error {
 func isStateError(err error) bool {
 	var state stateError
 	return errors.As(err, &state)
+}
+
+func projectionStateErrorf(format string, harnessID string, projection harness.Projection, arguments ...any) error {
+	return stateError{err: fmt.Errorf(format, arguments...), context: projectionProblemFields(harnessID, projection)}
 }
 
 // version is the release identity. It stays "dev" for an ordinary `go build`
@@ -262,7 +269,14 @@ func machineResult(output string, commandErr error) map[string]any {
 	}
 	result["state"] = state
 	if commandErr != nil {
-		result["problems"] = []map[string]string{{"code": code, "message": commandErr.Error()}}
+		problem := map[string]any{"code": code, "message": commandErr.Error()}
+		var stateErr stateError
+		if errors.As(commandErr, &stateErr) {
+			for key, value := range stateErr.context {
+				problem[key] = value
+			}
+		}
+		result["problems"] = []map[string]any{problem}
 	} else if trimmed := strings.TrimSpace(output); trimmed != "" {
 		result["result"] = map[string]any{"output": trimmed}
 	}
@@ -1110,7 +1124,7 @@ func newHarnessCommand() *cobra.Command {
 			linkedResult := []map[string]any{}
 			projectionResult := []map[string]any{}
 			problems := []map[string]any{}
-			driftCount, staleCount, unownedCount := 0, 0, 0
+			driftCount, missingCount, staleCount, unownedCount := 0, 0, 0, 0
 
 			showManaged := !statusUnowned
 			showUnowned := statusUnowned || statusAll
@@ -1129,13 +1143,20 @@ func newHarnessCommand() *cobra.Command {
 					if !showManaged {
 						continue
 					}
-					matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+					missing, err := projectionMissing(projection.Path)
 					if err != nil {
-						return fmt.Errorf("fingerprint Projection: %w", err)
+						return projectionStateErrorf("inspect projected %s: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
+					}
+					matches := false
+					if !missing {
+						matches, err = projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+						if err != nil {
+							return projectionStateErrorf("fingerprint projected %s: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
+						}
 					}
 					selected, _, err := artifact.NewStore(root).SelectedContentFilesPath(projection.Artifact)
 					if err != nil {
-						return stateErrorf("canonical %s is unavailable: %w", displayContent(projection.Artifact), err)
+						return projectionStateErrorf("canonical %s is unavailable: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
 					}
 					entry := map[string]any{
 						"harness":  candidate.ID,
@@ -1145,24 +1166,26 @@ func newHarnessCommand() *cobra.Command {
 						"path":     projection.Path,
 					}
 					switch {
-					case err == nil && matches && selected.Digest == projection.Revision:
+					case missing:
+						missingCount++
+						entry["status"] = "missing"
+						remedy := projectionSyncCommand(projection, candidate.ID)
+						problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s. Restore it with: %s", displayContent(projection.Artifact), candidate.ID, projection.Path, remedy), candidate.ID, projection)
+						problem["remedy"] = remedy
+						problems = append(problems, problem)
+					case matches && selected.Digest == projection.Revision:
 						entry["status"] = "projected"
-					case err == nil && matches:
+					case matches:
 						staleCount++
 						entry["status"] = "stale"
-						problems = append(problems, map[string]any{
-							"id":      fmt.Sprintf("stale-%02d", staleCount),
-							"code":    "projection_stale",
-							"message": fmt.Sprintf("Stale Projection %s %s", displayContent(projection.Artifact), projection.Path),
-						})
+						remedy := projectionSyncCommand(projection, candidate.ID)
+						problem := projectionProblem(fmt.Sprintf("stale-%02d", staleCount), "projection_stale", fmt.Sprintf("Projected %s in %s at %s is stale but unchanged. Update it with: %s", displayContent(projection.Artifact), candidate.ID, projection.Path, remedy), candidate.ID, projection)
+						problem["remedy"] = remedy
+						problems = append(problems, problem)
 					default:
 						driftCount++
 						entry["status"] = "drift"
-						problems = append(problems, map[string]any{
-							"id":      fmt.Sprintf("drift-%02d", driftCount),
-							"code":    "projection_drift",
-							"message": fmt.Sprintf("Drift %s %s", displayContent(projection.Artifact), projection.Path),
-						})
+						problems = append(problems, projectionProblem(fmt.Sprintf("drift-%02d", driftCount), "projection_drift", fmt.Sprintf("Projected %s in %s at %s differs from its recorded content. Inspect it before replacing it.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection))
 					}
 					projectionResult = append(projectionResult, entry)
 				}
@@ -1178,7 +1201,10 @@ func newHarnessCommand() *cobra.Command {
 					problems = append(problems, map[string]any{
 						"id":      fmt.Sprintf("unowned-%02d", unownedCount),
 						"code":    "unowned_path",
-						"message": fmt.Sprintf("Unowned path %s", path),
+						"harness": candidate.ID,
+						"kind":    "skill",
+						"message": fmt.Sprintf("Skill path %s in %s is not managed by Brigsby.", path, candidate.ID),
+						"path":    path,
 					})
 				}
 			}
@@ -1187,6 +1213,8 @@ func newHarnessCommand() *cobra.Command {
 			switch {
 			case driftCount > 0:
 				state = "drifted"
+			case missingCount > 0:
+				state = "missing"
 			case staleCount > 0:
 				state = "stale"
 			case unownedCount > 0:
@@ -1475,6 +1503,39 @@ func projectionFingerprintMatches(path, expected string) (bool, error) {
 		return false, err
 	}
 	return exact == expected, nil
+}
+
+func projectionMissing(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func projectionProblem(id, code, message, harnessID string, projection harness.Projection) map[string]any {
+	problem := projectionProblemFields(harnessID, projection)
+	problem["code"] = code
+	problem["id"] = id
+	problem["message"] = message
+	return problem
+}
+
+func projectionProblemFields(harnessID string, projection harness.Projection) map[string]any {
+	return map[string]any{
+		"harness": harnessID,
+		"kind":    kindWord(projection.Artifact),
+		"path":    projection.Path,
+		"ref":     artifact.DisplayRef(projection.Artifact),
+	}
+}
+
+func projectionSyncCommand(projection harness.Projection, harnessID string) string {
+	flag := "--skill"
+	if artifact.KeyKind(projection.Artifact) == artifact.KindInstruction {
+		flag = "--instruction"
+	}
+	return fmt.Sprintf("brigsby sync %s %s --harness %s", flag, artifact.DisplayRef(projection.Artifact), harnessID)
 }
 
 func projectionFor(projections []harness.Projection, harnessID, path string) (harness.Projection, bool) {

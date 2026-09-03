@@ -415,8 +415,11 @@ func TestHarnessStatusAfterRestoreReportsUnownedPath(t *testing.T) {
 	if env.State != "unowned" {
 		t.Fatalf("status state = %q, want unowned", env.State)
 	}
-	if !strings.Contains(env.problemText(), "Unowned path "+local) {
-		t.Fatalf("status problems = %s, want Unowned path %s", env.problemText(), local)
+	if !strings.Contains(env.problemText(), "is not managed by Brigsby") {
+		t.Fatalf("status problems = %s, want self-contained unowned-path problem", env.problemText())
+	}
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Path != local {
+		t.Fatalf("status problem = %+v, want structured unowned path details", problem)
 	}
 	if slices.Contains(env.problemCodes(), "projection_drift") || len(status.Projections) != 0 {
 		t.Fatalf("status problems=%+v projections=%+v, want unowned only", env.Problems, status.Projections)
@@ -832,6 +835,20 @@ func TestHarnessSyncProjectsStructuredGlobalInstructionsToCodex(t *testing.T) {
 	document, err := os.ReadFile(filepath.Join(home, ".codex", "brigsby", "personal-instructions", "docs", "core.md"))
 	if err != nil || string(document) != "Use focused tests.\n" {
 		t.Fatalf("rendered Codex Instruction doc = %q (err=%v)", document, err)
+	}
+	if err := os.RemoveAll(filepath.Join(home, ".codex")); err != nil {
+		t.Fatalf("remove projected Instruction root: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
+		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
+	}
+	env, status := decodeStatus(t, stdout.Bytes())
+	if env.State != "missing" || status.projectionStatus("main/personal-instructions") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
+		t.Fatalf("status output = %q, want missing Instruction Projection", stdout.String())
+	}
+	if problem := env.Problems[0]; problem.Kind != "instruction" || problem.Ref != "main/personal-instructions" || problem.Remedy != "brigsby sync --instruction main/personal-instructions --harness codex" {
+		t.Fatalf("status problem = %+v, want Instruction restore command", problem)
 	}
 }
 
@@ -1556,6 +1573,52 @@ func TestHarnessStatusReportsStateErrorWhenCanonicalSkillIsMissing(t *testing.T)
 	if !strings.Contains(env.problemText(), "canonical skill main/release-notes is unavailable") {
 		t.Fatalf("status problems = %+v, want unavailable canonical Skill", env.Problems)
 	}
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") {
+		t.Fatalf("status problem = %+v, want structured canonical-state error details", problem)
+	}
+}
+
+func TestHarnessStatusReportsMissingProjectionWithRestoreCommand(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatalf("write Skill source: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("create Codex fixture: %v", err)
+	}
+	for _, arguments := range [][]string{
+		{"harness", "link", "codex"},
+		{"skill", "add", source},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if got := run(arguments, &stdout, &stderr); got != 0 {
+			t.Fatalf("%v exit code = %d; stderr = %s", arguments, got, stderr.String())
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(skills, "release-notes")); err != nil {
+		t.Fatalf("remove projected Skill: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
+		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
+	}
+	env, status := decodeStatus(t, stdout.Bytes())
+	if env.State != "missing" || status.projectionStatus("main/release-notes") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
+		t.Fatalf("status output = %q, want missing projection", stdout.String())
+	}
+	problem := env.Problems[0]
+	if problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "is missing") {
+		t.Fatalf("status problem = %+v, want self-contained missing details and restore command", problem)
+	}
 }
 
 func TestHarnessStatusReportsDriftAfterProjectedSkillIsEdited(t *testing.T) {
@@ -1598,6 +1661,9 @@ func TestHarnessStatusReportsDriftAfterProjectedSkillIsEdited(t *testing.T) {
 	if !slices.Contains(env.problemCodes(), "projection_drift") {
 		t.Fatalf("status problems = %+v, want a projection_drift problem", env.Problems)
 	}
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || !strings.Contains(problem.Message, "differs from its recorded content") {
+		t.Fatalf("status problem = %+v, want self-contained drift details", problem)
+	}
 	if stderr.Len() != 0 {
 		t.Fatalf("status stderr = %q, want empty", stderr.String())
 	}
@@ -1624,8 +1690,11 @@ func TestHarnessStatusReportsUnownedLocalSkill(t *testing.T) {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "unowned" || !strings.Contains(env.problemText(), "Unowned path "+skills) {
-		t.Fatalf("status output = %q, want Unowned path %s", stdout.String(), skills)
+	if env.State != "unowned" || !strings.Contains(env.problemText(), "is not managed by Brigsby") {
+		t.Fatalf("status output = %q, want self-contained unowned path problem", stdout.String())
+	}
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Path != skills {
+		t.Fatalf("status problem = %+v, want structured unowned path details", problem)
 	}
 	if len(status.Projections) != 0 || slices.Contains(env.problemCodes(), "projection_drift") {
 		t.Fatalf("status output = %q, want Unowned path without Projection or Drift", stdout.String())
@@ -1672,6 +1741,9 @@ func TestHarnessStatusReportsStaleProjectionWhenSelectedRevisionChanges(t *testi
 	env, status := decodeStatus(t, stdout.Bytes())
 	if env.State != "stale" || status.projectionStatus("main/release-notes") != "stale" || !slices.Contains(env.problemCodes(), "projection_stale") {
 		t.Fatalf("status output = %q, want stale Projection after selected Revision changed", stdout.String())
+	}
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "stale but unchanged") {
+		t.Fatalf("status problem = %+v, want self-contained stale details and update command", problem)
 	}
 }
 
@@ -2338,6 +2410,11 @@ type cliProblem struct {
 	ID      string `json:"id"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Harness string `json:"harness"`
+	Kind    string `json:"kind"`
+	Path    string `json:"path"`
+	Ref     string `json:"ref"`
+	Remedy  string `json:"remedy"`
 }
 
 // execCLI runs one invocation and returns its exit code, the decoded stdout
