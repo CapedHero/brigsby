@@ -1511,6 +1511,53 @@ func TestHarnessStatusReportsCleanProjectionAfterSync(t *testing.T) {
 	}
 }
 
+func TestHarnessStatusReportsStateErrorWhenCanonicalSkillIsMissing(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("create Skill source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatalf("write Skill source: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("create Codex fixture: %v", err)
+	}
+	for _, arguments := range [][]string{
+		{"harness", "link", "codex"},
+		{"skill", "add", source},
+		{"sync", "--harness", "codex", "--skill", "main/release-notes"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if got := run(arguments, &stdout, &stderr); got != 0 {
+			t.Fatalf("%v exit code = %d, want 0; stderr = %s", arguments, got, stderr.String())
+		}
+	}
+	revisions := filepath.Join(home, ".brigsby", "skills", "main", "release-notes", "revisions")
+	entries, err := os.ReadDir(revisions)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("read canonical Skill revisions: entries=%v, err=%v", entries, err)
+	}
+	if err := os.RemoveAll(filepath.Join(revisions, entries[0].Name(), "files")); err != nil {
+		t.Fatalf("remove canonical Skill revision fixture: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 3; got != want {
+		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
+	}
+	env, _ := decodeStatus(t, stdout.Bytes())
+	if env.State != "invalid" || !slices.Contains(env.problemCodes(), "state_error") {
+		t.Fatalf("status output = %q, want invalid state_error", stdout.String())
+	}
+	if !strings.Contains(env.problemText(), "canonical skill main/release-notes is unavailable") {
+		t.Fatalf("status problems = %+v, want unavailable canonical Skill", env.Problems)
+	}
+}
+
 func TestHarnessStatusReportsDriftAfterProjectedSkillIsEdited(t *testing.T) {
 	home := t.TempDir()
 	skills := filepath.Join(home, ".agents", "skills")

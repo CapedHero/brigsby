@@ -43,6 +43,24 @@ func asDomainError(err error) error {
 	return domainError{err: err}
 }
 
+// stateError identifies unreadable canonical state. It is distinct from a
+// request error and from projection drift: the caller did not change the
+// projected content, Brigsby's own recorded source cannot be trusted.
+type stateError struct{ err error }
+
+func (err stateError) Error() string { return err.err.Error() }
+
+func (err stateError) Unwrap() error { return err.err }
+
+func stateErrorf(format string, arguments ...any) error {
+	return stateError{err: fmt.Errorf(format, arguments...)}
+}
+
+func isStateError(err error) bool {
+	var state stateError
+	return errors.As(err, &state)
+}
+
 // version is the release identity. It stays "dev" for an ordinary `go build`
 // or `go run` from a checkout and is overridden at release build time with
 // -ldflags "-X main.version=<tag>" (the Homebrew formula does this).
@@ -169,7 +187,7 @@ func isBlockedError(err error) bool {
 
 func isDomainError(err error) bool {
 	var domain domainError
-	return isBlockedError(err) || errors.As(err, &domain)
+	return isBlockedError(err) || isStateError(err) || errors.As(err, &domain)
 }
 
 // canonicalValue re-serialises any value so that every nested object becomes a
@@ -237,6 +255,8 @@ func machineResult(output string, commandErr error) map[string]any {
 	switch {
 	case isBlockedError(commandErr):
 		code, state = "blocked", "blocked"
+	case isStateError(commandErr):
+		code = "state_error"
 	case isDomainError(commandErr):
 		code = "domain_error"
 	}
@@ -1113,9 +1133,9 @@ func newHarnessCommand() *cobra.Command {
 					if err != nil {
 						return fmt.Errorf("fingerprint Projection: %w", err)
 					}
-					selected, err := artifact.NewStore(root).Selected(projection.Artifact)
-					if err != nil && !os.IsNotExist(err) {
-						return fmt.Errorf("read selected Artifact: %w", err)
+					selected, _, err := artifact.NewStore(root).SelectedContentFilesPath(projection.Artifact)
+					if err != nil {
+						return stateErrorf("canonical %s is unavailable: %w", displayContent(projection.Artifact), err)
 					}
 					entry := map[string]any{
 						"harness":  candidate.ID,
