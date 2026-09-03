@@ -65,6 +65,29 @@ func TestPublicCIRunsOnlyOnThePublicRepository(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowRunsOnlyOnThePublicRepository(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(contents)
+	if want := "if: github.repository == 'CapedHero/brigsby'"; strings.Count(workflow, want) < 2 {
+		t.Fatalf("release.yml must scope the build and release jobs to CapedHero/brigsby; got:\n%s", workflow)
+	}
+}
+
+func TestReleaseManifestExportsTheInstallerAndReleaseWorkflow(t *testing.T) {
+	manifest, err := Load(filepath.Join("..", "..", "release-manifest.toml"))
+	if err != nil {
+		t.Fatalf("load release manifest: %v", err)
+	}
+	for _, pathname := range []string{"install.sh", ".github/workflows/release.yml"} {
+		if !contains(manifest.Export.Allow, pathname) {
+			t.Errorf("release manifest does not export %q: %#v", pathname, manifest.Export.Allow)
+		}
+	}
+}
+
 func TestFirstPartyTeachingSkillIsTheOnlyExportableSkillPath(t *testing.T) {
 	if err := validateAllowedPath("skills/brigsby"); err != nil {
 		t.Fatalf("first-party Skill path rejected: %v", err)

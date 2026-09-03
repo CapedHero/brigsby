@@ -1,7 +1,7 @@
 {
   "skill_path": "skills/brigsby/SKILL.md",
   "name": "brigsby",
-  "description_contains": "Manage Brigsby Artifacts",
+  "description_contains": "Manage Brigsby Skills and global Instructions",
   "required_references": [
     "references/workflows.md"
   ],
@@ -20,12 +20,13 @@
     {"argv": ["harness", "discover", "--help"], "contains": "Usage:\n  brigsby harness discover"},
     {"argv": ["harness", "link", "--help"], "contains": "Usage:\n  brigsby harness link"},
     {"argv": ["harness", "status", "--help"], "contains": "Usage:\n  brigsby harness status"},
-    {"argv": ["artifact", "add", "--help"], "contains": "Usage:\n  brigsby artifact add"},
+    {"argv": ["skill", "add", "--help"], "contains": "Usage:\n  brigsby skill add"},
+    {"argv": ["instruction", "add", "--help"], "contains": "Usage:\n  brigsby instruction add"},
     {"argv": ["harness", "sync", "--help"], "contains": "Usage:\n  brigsby harness sync"},
     {"argv": ["package", "create", "--help"], "contains": "Usage:\n  brigsby package create"},
     {"argv": ["package", "inspect", "--help"], "contains": "Usage:\n  brigsby package inspect"},
     {"argv": ["package", "import", "--help"], "contains": "Usage:\n  brigsby package import"},
-    {"argv": ["artifact", "promote", "--help"], "contains": "Usage:\n  brigsby artifact promote"},
+    {"argv": ["skill", "promote", "--help"], "contains": "Usage:\n  brigsby skill promote"},
     {"argv": ["recovery", "list", "--help"], "contains": "Usage:\n  brigsby recovery list"},
     {"argv": ["recovery", "show", "--help"], "contains": "Usage:\n  brigsby recovery show"},
     {"argv": ["recovery", "restore", "--help"], "contains": "Usage:\n  brigsby recovery restore"}

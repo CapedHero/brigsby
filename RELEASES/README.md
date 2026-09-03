@@ -17,7 +17,11 @@ Release-manifest digest: sha256-<hex>
 Exporter: brigsby-release-export/v1
 Private CI: <run URL or ID>
 Public CI: <run URL or ID>
+Release build: <run URL or ID>
 Homebrew tap commit: <sha or n/a>
 ```
 
 `Homebrew tap commit` is `n/a` for a tag that predates the Homebrew tap.
+`Release build` is the `Release` workflow run that published the prebuilt
+archives and `checksums.txt` for the tag (ADR 0013); it is `n/a` for a tag that
+predates that workflow.

@@ -1,18 +1,21 @@
 ---
 name: brigsby
-description: Manage Brigsby Artifacts when a Caller needs to inspect linked Harnesses, add or synchronize Skills and Instructions, resolve drift, share a Package, or restore a Brigsby change.
+description: Manage Brigsby Skills and global Instructions when a Caller needs to inspect linked Harnesses, add or synchronize content, resolve drift, share a Package, or restore a Brigsby change.
 ---
 
 # Brigsby
 
 Use Brigsby to manage text-based Skills and global Instructions across linked
-Harnesses. Its leading loop is **observe → choose → act → verify**.
+Harnesses. It gives each kind its own command group — `brigsby skill …` and
+`brigsby instruction …` — and there is no umbrella `artifact` command. Its
+leading loop is **observe → choose → act → verify**.
 
 ## Establish the interface
 
 1. Run `brigsby --help` when this task needs a command or capability you do
    not already know. Before a mutation, package operation, recovery, or any
-   uncertain option, also read the relevant nested help.
+   uncertain option, also read the relevant nested help (for example
+   `brigsby skill add --help`, `brigsby harness sync --help`).
 2. If Brigsby is absent, the needed command is unavailable, or the help does
    not support the request, stop before mutation. State the exact gap and ask
    the Caller to install, upgrade, or choose another approach. On macOS the
@@ -25,26 +28,36 @@ current syntax is known.
 ## Choose the operation
 
 1. Treat a question or investigation as read-only. Use the inventory/status
-   command from current CLI help.
-2. Use a dry run when the Caller asks for a preview or when the desired change
+   command from current CLI help (`brigsby status`, `brigsby skill list`,
+   `brigsby instruction list`, `brigsby skill show`).
+2. A Skill and a global Instruction set are different things: capture a Skill
+   with `brigsby skill add <dir-with-SKILL.md>`, and a structured Instruction
+   set with `brigsby instruction add <dir-with-instructions.toml>`. Let CLI
+   help confirm which group the request needs.
+3. Use a dry run when the Caller asks for a preview or when the desired change
    is unclear.
-3. An explicit, narrow request to sync or import authorizes the
+4. An explicit, narrow request to sync or import authorizes the
    corresponding direct command. Brigsby's preflight, Recovery capture, and
    post-write verification protect that operation.
-4. Pause and show the situation for approval when intent or scope is
-   ambiguous; more than one plausible Artifact or Harness is involved; a force
-   replacement, package-output replacement, restore, or unknown capability is
-   required.
+5. Pause and show the situation for approval when intent or scope is
+   ambiguous; more than one plausible Skill, Instruction, or Harness is
+   involved; a force replacement, package-output replacement, restore, or
+   unknown capability is required.
 
 Completion: the command matches the Caller's explicit intent, or the Caller
 has been given the concrete choice needed to continue.
 
 ## Act and verify
 
-1. Run the selected command using the syntax just confirmed by CLI help.
-2. When the task needs structured interpretation and current help supports it,
-   request JSON. Read `state` and `problems` as authoritative; use filtering
-   only when the Caller needs a smaller machine-readable result.
+1. Run the selected command using the syntax just confirmed by CLI help. A
+   reference is `namespace/name` (default namespace `main`); the kind comes
+   from the command group, or from `--skill` / `--instruction` on
+   `brigsby harness sync` and `brigsby package create`.
+2. Every command result is one pretty-printed, key-sorted JSON envelope on
+   stdout (`--help` and `--version` are the only plain-text output). Read
+   `state` and `problems` as authoritative; a failure also echoes one line to
+   stderr, which is a convenience, not the contract. Use `--jq` only when the
+   Caller needs a smaller slice of the envelope.
 3. For a blocked result, present the CLI's ready-to-run actions. Do not invent
    a merge or alter selectors/fingerprints. Ask for direction when both
    “preserve local” and “restore canonical” are plausible.

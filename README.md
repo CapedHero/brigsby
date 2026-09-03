@@ -31,6 +31,33 @@ brew install brigsby
 Either way the build compiles `brigsby` from source and pulls a Go toolchain as
 a build dependency. Confirm with `brigsby --version`.
 
+### Linux and CI (`curl | sh`)
+
+On Linux, in containers, or in CI, install a prebuilt binary. Inspect the script
+first:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CapedHero/brigsby/main/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+Or, once you trust it, in one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CapedHero/brigsby/main/install.sh | sh
+```
+
+The script downloads the release archive for your platform, verifies its
+published SHA-256 checksum, installs `brigsby` to `~/.local/bin` without `sudo`,
+and checks the build-provenance attestation when the GitHub CLI is present. It
+honours `BRIGSBY_VERSION` (a tag such as `0.0.4`, default `latest`) and
+`BRIGSBY_INSTALL_DIR`. On macOS, prefer Homebrew above.
+
+Prebuilt `brigsby_<os>_<arch>.tar.gz` archives and `checksums.txt` are attached
+to every [GitHub Release](https://github.com/CapedHero/brigsby/releases) for
+manual download too.
+
 ### Go toolchain
 
 ```sh

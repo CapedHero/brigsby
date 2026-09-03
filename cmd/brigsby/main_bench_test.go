@@ -33,7 +33,7 @@ func BenchmarkHarnessSyncDryRun(b *testing.B) {
 	}
 	b.Setenv("HOME", home)
 	b.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "codex-personal"}, {"artifact", "add", source}} {
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"skill", "add", source}} {
 		var stdout, stderr bytes.Buffer
 		if code := run(arguments, &stdout, &stderr); code != 0 {
 			b.Fatalf("setup %v failed with %d: %s", arguments, code, stderr.String())
@@ -43,13 +43,13 @@ func BenchmarkHarnessSyncDryRun(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"harness", "sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
+		if code := run([]string{"harness", "sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
 			b.Fatalf("dry-run failed with %d: %s", code, stderr.String())
 		}
 	}
 }
 
-func BenchmarkRootSyncDryRunJSON(b *testing.B) {
+func BenchmarkRootSyncDryRun(b *testing.B) {
 	home := b.TempDir()
 	skills := filepath.Join(home, ".agents", "skills")
 	source := filepath.Join(home, "release-notes")
@@ -64,7 +64,7 @@ func BenchmarkRootSyncDryRunJSON(b *testing.B) {
 	}
 	b.Setenv("HOME", home)
 	b.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
-	for _, arguments := range [][]string{{"harness", "link", "codex-personal"}, {"add", source}} {
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"skill", "add", source}} {
 		var stdout, stderr bytes.Buffer
 		if code := run(arguments, &stdout, &stderr); code != 0 {
 			b.Fatalf("setup %v failed with %d: %s", arguments, code, stderr.String())
@@ -74,8 +74,8 @@ func BenchmarkRootSyncDryRunJSON(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"sync", "--harness", "codex-personal", "--artifact", "main/skills/release-notes", "--dry-run", "--json", "all"}, &stdout, &stderr); code != 0 {
-			b.Fatalf("JSON dry-run failed with %d: %s", code, stderr.String())
+		if code := run([]string{"sync", "--harness", "codex", "--skill", "main/release-notes", "--dry-run"}, &stdout, &stderr); code != 0 {
+			b.Fatalf("dry-run failed with %d: %s", code, stderr.String())
 		}
 	}
 }

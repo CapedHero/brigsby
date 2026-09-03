@@ -1,4 +1,8 @@
-// Package artifact owns immutable canonical Artifact revisions.
+// Package artifact owns immutable canonical revisions for the two Caller-facing
+// content kinds, Skills and Instructions. "Artifact" is an internal term for a
+// versioned unit of either kind; it is never shown to a Caller. A Caller names
+// content by a "namespace/name" reference plus the command group's kind; the
+// engine keys it internally as "namespace/kind/name".
 package artifact
 
 import (
@@ -22,10 +26,70 @@ const (
 	maxBytes = 1 << 20
 )
 
-// Revision identifies one immutable captured payload.
+// Revision identifies one immutable captured payload. Selector is the internal
+// key "namespace/kind/name" and is never rendered to a Caller; use DisplayRef
+// for output and KeyKind to recover the kind.
 type Revision struct {
 	Selector string
 	Digest   string
+}
+
+// Kinds are the two Caller-facing content groups.
+const (
+	KindSkill       = "skills"
+	KindInstruction = "instructions"
+)
+
+// reservedNamespaces are directory names taken by the canonical layout, so a
+// Namespace may never use one.
+var reservedNamespaces = map[string]struct{}{
+	"skills": {}, "instructions": {}, "namespaces": {}, "recovery": {},
+}
+
+// Key builds the internal identity for a Caller-supplied reference. ref is
+// "name" or "namespace/name"; kind is KindSkill or KindInstruction. The result
+// has the internal form "namespace/kind/name".
+func Key(kind, ref string) (string, error) {
+	if kind != KindSkill && kind != KindInstruction {
+		return "", fmt.Errorf("unsupported kind %q", kind)
+	}
+	namespace, name := "main", ref
+	if slash := strings.IndexByte(ref, '/'); slash >= 0 {
+		namespace, name = ref[:slash], ref[slash+1:]
+	}
+	if strings.Contains(name, "/") {
+		return "", fmt.Errorf("invalid selector %q; use namespace/name", ref)
+	}
+	if err := validateIdentity(namespace, name); err != nil {
+		return "", err
+	}
+	return namespace + "/" + kind + "/" + name, nil
+}
+
+// DisplayRef renders an internal key as the Caller-facing "namespace/name".
+func DisplayRef(key string) string {
+	if parts := strings.Split(key, "/"); len(parts) == 3 {
+		return parts[0] + "/" + parts[2]
+	}
+	return key
+}
+
+// KeyKind returns the kind segment of an internal key, or "" if malformed.
+func KeyKind(key string) string {
+	if parts := strings.Split(key, "/"); len(parts) == 3 {
+		return parts[1]
+	}
+	return ""
+}
+
+func validateIdentity(namespace, name string) error {
+	if !kebab(namespace) || !kebab(name) {
+		return fmt.Errorf("namespace and name must be lower-case ASCII kebab-case")
+	}
+	if _, reserved := reservedNamespaces[namespace]; reserved {
+		return fmt.Errorf("namespace %q is reserved", namespace)
+	}
+	return nil
 }
 
 // Origin identifies the imported revision from which a main selection was
@@ -47,6 +111,17 @@ type Store struct{ root string }
 
 // NewStore creates a no-write canonical Artifact store.
 func NewStore(root string) Store { return Store{root: root} }
+
+// artifactDir is the on-disk directory for one canonical unit. The layout is
+// kind-first: <root>/<kind>/<namespace>/<name>.
+func (s Store) artifactDir(namespace, kind, name string) string {
+	return filepath.Join(s.root, kind, namespace, name)
+}
+
+// namespaceManifestPath is the per-Namespace configuration file.
+func (s Store) namespaceManifestPath(namespace string) string {
+	return filepath.Join(s.root, "namespaces", namespace+".toml")
+}
 
 type rootManifest struct {
 	SchemaVersion int `toml:"schema_version"`
@@ -156,8 +231,8 @@ func (s Store) planCaptureSkill(source string, options CaptureOptions) (Revision
 	if name == "" {
 		name = filepath.Base(absSource)
 	}
-	if !kebab(namespace) || !kebab(name) {
-		return Revision{}, nil, fmt.Errorf("namespace and Skill name must be lower-case ASCII kebab-case")
+	if err := validateIdentity(namespace, name); err != nil {
+		return Revision{}, nil, err
 	}
 	digest := digest("skills", members)
 	selector := namespace + "/skills/" + name
@@ -190,8 +265,8 @@ func (s Store) CaptureInstructions(source string, options CaptureOptions) (Revis
 	if name == "" {
 		name = filepath.Base(absSource)
 	}
-	if !kebab(namespace) || !kebab(name) {
-		return Revision{}, fmt.Errorf("namespace and Instruction name must be lower-case ASCII kebab-case")
+	if err := validateIdentity(namespace, name); err != nil {
+		return Revision{}, err
 	}
 	digest := digest("instructions", members)
 	revision := Revision{Selector: namespace + "/instructions/" + name, Digest: digest}
@@ -207,51 +282,44 @@ type ListOptions struct {
 	Kind      string
 }
 
-// List returns selected Revisions for stored Artifacts, sorted by selector.
-// A missing artifacts tree is an empty library.
+// List returns selected Revisions for stored canonical units, sorted by
+// internal key. A missing kind tree is an empty library.
 func (s Store) List(options ListOptions) ([]Revision, error) {
 	if options.Namespace != "" && !kebab(options.Namespace) {
 		return nil, fmt.Errorf("namespace must be lower-case ASCII kebab-case")
 	}
-	if options.Kind != "" && options.Kind != "skills" && options.Kind != "instructions" {
-		return nil, fmt.Errorf("unsupported Artifact kind %q", options.Kind)
+	if options.Kind != "" && options.Kind != KindSkill && options.Kind != KindInstruction {
+		return nil, fmt.Errorf("unsupported kind %q", options.Kind)
 	}
-	artifactsRoot := filepath.Join(s.root, "artifacts")
-	namespaces, err := os.ReadDir(artifactsRoot)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read Artifacts: %w", err)
+	kinds := []string{KindSkill, KindInstruction}
+	if options.Kind != "" {
+		kinds = []string{options.Kind}
 	}
 	var revisions []Revision
-	for _, namespace := range namespaces {
-		if !namespace.IsDir() || options.Namespace != "" && namespace.Name() != options.Namespace {
+	for _, kind := range kinds {
+		namespaces, err := os.ReadDir(filepath.Join(s.root, kind))
+		if os.IsNotExist(err) {
 			continue
 		}
-		kinds, err := os.ReadDir(filepath.Join(artifactsRoot, namespace.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read Namespace: %w", err)
+			return nil, fmt.Errorf("read %s: %w", kind, err)
 		}
-		for _, kind := range kinds {
-			if !kind.IsDir() || options.Kind != "" && kind.Name() != options.Kind {
+		for _, namespace := range namespaces {
+			if !namespace.IsDir() || (options.Namespace != "" && namespace.Name() != options.Namespace) {
 				continue
 			}
-			if kind.Name() != "skills" && kind.Name() != "instructions" {
-				continue
-			}
-			names, err := os.ReadDir(filepath.Join(artifactsRoot, namespace.Name(), kind.Name()))
+			names, err := os.ReadDir(filepath.Join(s.root, kind, namespace.Name()))
 			if err != nil {
-				return nil, fmt.Errorf("read Artifact kind: %w", err)
+				return nil, fmt.Errorf("read Namespace: %w", err)
 			}
 			for _, name := range names {
 				if !name.IsDir() {
 					continue
 				}
-				selector := namespace.Name() + "/" + kind.Name() + "/" + name.Name()
+				selector := namespace.Name() + "/" + kind + "/" + name.Name()
 				revision, err := s.Selected(selector)
 				if err != nil {
-					return nil, fmt.Errorf("read Artifact %s: %w", selector, err)
+					return nil, fmt.Errorf("read %s: %w", selector, err)
 				}
 				revisions = append(revisions, revision)
 			}
@@ -259,6 +327,28 @@ func (s Store) List(options ListOptions) ([]Revision, error) {
 	}
 	sort.Slice(revisions, func(i, j int) bool { return revisions[i].Selector < revisions[j].Selector })
 	return revisions, nil
+}
+
+// Revisions returns every stored Revision digest for a canonical Artifact
+// selector, sorted, so a Caller can choose one without knowing it in advance.
+// A missing Artifact returns an fs.ErrNotExist error.
+func (s Store) Revisions(selector string) ([]string, error) {
+	parts := strings.Split(selector, "/")
+	if len(parts) != 3 || (parts[1] != "skills" && parts[1] != "instructions") || !kebab(parts[0]) || !kebab(parts[2]) {
+		return nil, fmt.Errorf("invalid Artifact selector %q", selector)
+	}
+	entries, err := os.ReadDir(filepath.Join(s.artifactDir(parts[0], parts[1], parts[2]), "revisions"))
+	if err != nil {
+		return nil, err
+	}
+	var digests []string
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "sha256-") {
+			digests = append(digests, entry.Name())
+		}
+	}
+	sort.Strings(digests)
+	return digests, nil
 }
 
 // Selected returns the current selected Revision for a canonical selector.
@@ -284,7 +374,7 @@ func (s Store) artifactManifest(selector string) (artifactManifest, error) {
 	if len(parts) != 3 || (parts[1] != "skills" && parts[1] != "instructions") || !kebab(parts[0]) || !kebab(parts[2]) {
 		return artifactManifest{}, fmt.Errorf("invalid Artifact selector %q", selector)
 	}
-	contents, err := os.ReadFile(filepath.Join(s.root, "artifacts", parts[0], parts[1], parts[2], "artifact.toml"))
+	contents, err := os.ReadFile(filepath.Join(s.artifactDir(parts[0], parts[1], parts[2]), "artifact.toml"))
 	if err != nil {
 		return artifactManifest{}, err
 	}
@@ -311,7 +401,16 @@ func (s Store) SelectedFilesPath(selector string) (Revision, string, error) {
 		return Revision{}, "", err
 	}
 	parts := strings.Split(selector, "/")
-	return revision, filepath.Join(s.root, "artifacts", parts[0], "skills", parts[2], "revisions", revision.Digest, "files"), nil
+	return revision, filepath.Join(s.artifactDir(parts[0], "skills", parts[2]), "revisions", revision.Digest, "files"), nil
+}
+
+// SelectedContentFilesPath returns the immutable runtime tree for the selected
+// revision of either kind. Callers must treat it as read-only canonical content.
+func (s Store) SelectedContentFilesPath(selector string) (Revision, string, error) {
+	if KeyKind(selector) == KindInstruction {
+		return s.selectedInstructionFilesPath(selector)
+	}
+	return s.SelectedFilesPath(selector)
 }
 
 // RenderSelectedInstructions produces a native root plus a complete copied
@@ -383,8 +482,7 @@ func (s Store) SetPrefix(namespace, prefix string) error {
 	if err := s.ensureRoot(); err != nil {
 		return err
 	}
-	directory := filepath.Join(s.root, "artifacts", namespace)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(s.root, "namespaces"), 0o700); err != nil {
 		return err
 	}
 	replacement, err := s.namespaceReplacement(namespace, prefix)
@@ -392,7 +490,7 @@ func (s Store) SetPrefix(namespace, prefix string) error {
 		return err
 	}
 	defer os.Remove(replacement)
-	plan, err := recovery.New(s.root).Plan(filepath.Join(directory, "namespace.toml"), replacement)
+	plan, err := recovery.New(s.root).Plan(s.namespaceManifestPath(namespace), replacement)
 	if err != nil {
 		return fmt.Errorf("plan Namespace prefix: %w", err)
 	}
@@ -417,7 +515,7 @@ func (s Store) Prefix(namespace string) (string, error) {
 	if !kebab(namespace) {
 		return "", fmt.Errorf("invalid Namespace %q", namespace)
 	}
-	contents, err := os.ReadFile(filepath.Join(s.root, "artifacts", namespace, "namespace.toml"))
+	contents, err := os.ReadFile(s.namespaceManifestPath(namespace))
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -526,7 +624,7 @@ func (s Store) Select(selector, revisionDigest string) (Revision, error) {
 		return current, nil
 	}
 	parts := strings.Split(selector, "/")
-	artifactDir := filepath.Join(s.root, "artifacts", parts[0], parts[1], parts[2])
+	artifactDir := s.artifactDir(parts[0], parts[1], parts[2])
 	replacement, err := s.selectionReplacement(parts[0], parts[1], parts[2], revisionDigest)
 	if err != nil {
 		return Revision{}, err
@@ -549,27 +647,34 @@ func (s Store) Select(selector, revisionDigest string) (Revision, error) {
 	return revision, nil
 }
 
-// Promote copies one verified imported Skill revision into main while retaining
-// the source revision unchanged in its imported Namespace.
+// Promote copies one verified imported Skill or Instruction revision into main
+// while retaining the source revision unchanged in its imported Namespace.
 func (s Store) Promote(selector, revisionDigest string) (Revision, error) {
 	parts := strings.Split(selector, "/")
-	if len(parts) != 3 || parts[0] == "main" || parts[1] != "skills" {
-		return Revision{}, fmt.Errorf("promotion requires an imported Skill selector")
+	if len(parts) != 3 || parts[0] == "main" || (parts[1] != KindSkill && parts[1] != KindInstruction) {
+		return Revision{}, fmt.Errorf("promotion requires an imported skill or instruction selector")
 	}
+	kind := parts[1]
 	if _, err := s.VerifyRevision(selector, revisionDigest); err != nil {
 		return Revision{}, err
 	}
-	source := filepath.Join(s.root, "artifacts", parts[0], "skills", parts[2], "revisions", revisionDigest, "files")
-	members, err := readSkill(source)
+	source := filepath.Join(s.artifactDir(parts[0], kind, parts[2]), "revisions", revisionDigest, "files")
+	var members []member
+	var err error
+	if kind == KindInstruction {
+		members, _, err = readInstructions(source)
+	} else {
+		members, err = readSkill(source)
+	}
 	if err != nil {
 		return Revision{}, err
 	}
-	revision := Revision{Selector: "main/skills/" + parts[2], Digest: revisionDigest}
-	artifactDir, err := s.storeKind("skills", "main", parts[2], revision, members, true)
+	revision := Revision{Selector: "main/" + kind + "/" + parts[2], Digest: revisionDigest}
+	artifactDir, err := s.storeKind(kind, "main", parts[2], revision, members, true)
 	if err != nil {
 		return Revision{}, err
 	}
-	replacement, err := s.selectionReplacement("main", "skills", parts[2], revision.Digest, selector, revisionDigest)
+	replacement, err := s.selectionReplacement("main", kind, parts[2], revision.Digest, selector, revisionDigest)
 	if err != nil {
 		return Revision{}, err
 	}
@@ -643,7 +748,7 @@ func (s Store) verifySkillRevision(selector, revisionDigest string) error {
 	if len(parts) != 3 || parts[1] != "skills" {
 		return fmt.Errorf("invalid Skill selector %q", selector)
 	}
-	path := filepath.Join(s.root, "artifacts", parts[0], "skills", parts[2], "revisions", revisionDigest, "files")
+	path := filepath.Join(s.artifactDir(parts[0], "skills", parts[2]), "revisions", revisionDigest, "files")
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("inspect Revision files: %w", err)
@@ -684,7 +789,7 @@ func (s Store) selectedInstructionFilesPath(selector string) (Revision, string, 
 	if err != nil {
 		return Revision{}, "", err
 	}
-	path := filepath.Join(s.root, "artifacts", parts[0], "instructions", parts[2], "revisions", revision.Digest, "files")
+	path := filepath.Join(s.artifactDir(parts[0], "instructions", parts[2]), "revisions", revision.Digest, "files")
 	if err := s.verifyInstructionRevision(selector, revision.Digest); err != nil {
 		return Revision{}, "", err
 	}
@@ -696,7 +801,7 @@ func (s Store) verifyInstructionRevision(selector, revisionDigest string) error 
 	if len(parts) != 3 || parts[1] != "instructions" {
 		return fmt.Errorf("invalid Instruction selector %q", selector)
 	}
-	path := filepath.Join(s.root, "artifacts", parts[0], "instructions", parts[2], "revisions", revisionDigest, "files")
+	path := filepath.Join(s.artifactDir(parts[0], "instructions", parts[2]), "revisions", revisionDigest, "files")
 	members, _, err := readInstructions(path)
 	if err != nil {
 		return fmt.Errorf("validate Revision files: %w", err)
@@ -735,7 +840,7 @@ func (s Store) storeKind(kind, namespace, name string, revision Revision, member
 	if err := s.ensureRoot(); err != nil {
 		return "", err
 	}
-	artifactDir := filepath.Join(s.root, "artifacts", namespace, kind, name)
+	artifactDir := s.artifactDir(namespace, kind, name)
 	if existing, err := s.Selected(revision.Selector); err == nil && existing.Digest != revision.Digest && !explicitName {
 		return "", fmt.Errorf("Artifact %q already has a different selected revision; repeat with --name %q to add to its history", revision.Selector, name)
 	} else if err != nil && !os.IsNotExist(err) {
