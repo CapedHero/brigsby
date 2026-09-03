@@ -65,6 +65,26 @@ func (r Registry) ForgetProjection(path string) error {
 	return r.writeProjections(current)
 }
 
+// ForgetArtifact removes every ownership record for one canonical selector and
+// returns the removed records so a caller can restore them after recovery.
+func (r Registry) ForgetArtifact(selector string) ([]Projection, error) {
+	current, err := r.readProjections()
+	if err != nil {
+		return nil, err
+	}
+	removed := []Projection{}
+	kept := current.Projections[:0]
+	for _, projection := range current.Projections {
+		if projection.Artifact == selector {
+			removed = append(removed, projection)
+			continue
+		}
+		kept = append(kept, projection)
+	}
+	current.Projections = kept
+	return removed, r.writeProjections(current)
+}
+
 // ListProjections returns recorded Projections without creating canonical state.
 func (r Registry) ListProjections() ([]Projection, error) {
 	current, err := r.readProjections()

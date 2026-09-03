@@ -12,9 +12,11 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/CapedHero/brigsby/internal/artifact"
 	"github.com/CapedHero/brigsby/internal/harness"
+	"github.com/CapedHero/brigsby/internal/lifecycle"
 	"github.com/CapedHero/brigsby/internal/portable"
 	"github.com/CapedHero/brigsby/internal/recovery"
 	"github.com/itchyny/gojq"
@@ -50,6 +52,18 @@ type stateError struct {
 	err     error
 	context map[string]any
 }
+
+// partialError means a valid lifecycle command changed some state but left one
+// persisted recovery batch that can restore the entire pre-command snapshot.
+type partialError struct {
+	batchID string
+	err     error
+}
+
+func (err partialError) Error() string {
+	return fmt.Sprintf("PARTIAL: lifecycle batch %s can be restored with 'brigsby recovery restore %s': %v", err.batchID, err.batchID, err.err)
+}
+func (err partialError) Unwrap() error { return err.err }
 
 func (err stateError) Error() string { return err.err.Error() }
 
@@ -194,7 +208,12 @@ func isBlockedError(err error) bool {
 
 func isDomainError(err error) bool {
 	var domain domainError
-	return isBlockedError(err) || isStateError(err) || errors.As(err, &domain)
+	return isPartialError(err) || isBlockedError(err) || isStateError(err) || errors.As(err, &domain)
+}
+
+func isPartialError(err error) bool {
+	var partial partialError
+	return errors.As(err, &partial)
 }
 
 // canonicalValue re-serialises any value so that every nested object becomes a
@@ -260,6 +279,8 @@ func machineResult(output string, commandErr error) map[string]any {
 	}
 	code, state := "invalid_request", "invalid"
 	switch {
+	case isPartialError(commandErr):
+		code, state = "partial", "partial"
 	case isBlockedError(commandErr):
 		code, state = "blocked", "blocked"
 	case isStateError(commandErr):
@@ -277,6 +298,10 @@ func machineResult(output string, commandErr error) map[string]any {
 			}
 		}
 		result["problems"] = []map[string]any{problem}
+		var partial partialError
+		if errors.As(commandErr, &partial) {
+			result["result"] = map[string]any{"recovery_id": partial.batchID}
+		}
 	} else if trimmed := strings.TrimSpace(output); trimmed != "" {
 		result["result"] = map[string]any{"output": trimmed}
 	}
@@ -336,7 +361,70 @@ func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression st
 // envelope with no problems. run() re-reads it, applies --jq, and prints the
 // sorted, pretty result.
 func emitResult(out io.Writer, _ string, state string, result any) error {
-	return emitEnvelope(out, state, []any{}, result)
+	problems := []any{}
+	if state == "applied" {
+		problems = append(problems, recoveryGCProblems()...)
+	}
+	return emitEnvelope(out, state, problems, result)
+}
+
+// recoveryGCProblems applies retention after a committed mutation. Cleanup can
+// fail independently of the mutation, so it is reported without retracting an
+// already-applied result or hiding the recovery ID needed to undo it.
+func recoveryGCProblems() []any {
+	root, err := brigsbyHome()
+	if err != nil {
+		return []any{map[string]any{"code": "gc_failed", "message": err.Error()}}
+	}
+	if _, _, err := pruneRecovery(root, time.Now()); err != nil {
+		return []any{map[string]any{"code": "gc_failed", "message": err.Error()}}
+	}
+	return nil
+}
+
+// pruneRecovery enforces one 16 MiB budget across ordinary Recovery bundles
+// and multi-path lifecycle batches, rather than granting each store its own
+// independent allowance.
+func pruneRecovery(root string, now time.Time) (recovery.PruneResult, recovery.PruneResult, error) {
+	policy := recovery.DefaultRetention()
+	ordinary, err := recovery.New(root).Prune(policy, now)
+	if err != nil {
+		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("garbage collect Recovery: %w", err)
+	}
+	used, err := recoverableBytes(filepath.Join(root, "recovery"))
+	if err != nil {
+		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("measure Recovery retention: %w", err)
+	}
+	lifecyclePolicy := policy
+	lifecyclePolicy.MaxBytes -= used
+	if lifecyclePolicy.MaxBytes < 0 {
+		lifecyclePolicy.MaxBytes = 0
+	}
+	lifecycleResult, err := lifecycle.New(root).Prune(lifecyclePolicy, now)
+	if err != nil {
+		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("garbage collect lifecycle: %w", err)
+	}
+	return ordinary, lifecycleResult, nil
+}
+
+func recoverableBytes(root string) (int64, error) {
+	var bytes int64
+	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			bytes += info.Size()
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	return bytes, err
 }
 
 // emitEnvelope is emitResult for the few commands (harness status) that report
@@ -437,9 +525,35 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newNamespaceCommand())
 	root.AddCommand(newPackageCommand())
 	root.AddCommand(newRecoveryCommand())
+	root.AddCommand(newGCCommand())
 	root.AddCommand(newStatusRootAlias())
 	root.AddCommand(newSyncCommand())
 	return root
+}
+
+func newGCCommand() *cobra.Command {
+	var dryRun bool
+	command := &cobra.Command{Use: "gc", Short: "Remove expired Brigsby recovery data.", Args: cobra.NoArgs, RunE: func(command *cobra.Command, _ []string) error {
+		root, err := brigsbyHome()
+		if err != nil {
+			return err
+		}
+		if dryRun {
+			return emitResult(command.OutOrStdout(), "gc", "planned", map[string]any{"retention_days": 30})
+		}
+		result, lifecycleResult, err := pruneRecovery(root, time.Now())
+		if err != nil {
+			return err
+		}
+		removed := make([]string, len(result.Removed))
+		for index, operation := range result.Removed {
+			removed[index] = operation.ID
+		}
+		removed = append(removed, recoveryOperationIDs(lifecycleResult.Removed)...)
+		return emitResult(command.OutOrStdout(), "gc", "applied", map[string]any{"reclaimed_bytes": result.ReclaimedBytes + lifecycleResult.ReclaimedBytes, "removed": removed})
+	}}
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	return command
 }
 
 func newRootAlias(name string, target []string, short string, configure func(*cobra.Command, *[]string)) *cobra.Command {
@@ -680,6 +794,15 @@ func newRecoveryCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if lifecycle.New(root).Exists(arguments[0]) {
+				if restoreDryRun {
+					return emitResult(command.OutOrStdout(), "recovery restore", "planned", map[string]any{"restored": map[string]any{"recovery_id": arguments[0]}})
+				}
+				if err := lifecycle.New(root).Restore(arguments[0]); err != nil {
+					return fmt.Errorf("restore lifecycle batch: %w", err)
+				}
+				return emitResult(command.OutOrStdout(), "recovery restore", "applied", map[string]any{"restored": map[string]any{"recovery_id": arguments[0]}})
+			}
 			service := recovery.New(root)
 			record, err := service.Show(arguments[0])
 			if err != nil {
@@ -893,6 +1016,183 @@ func newContentCommand(word, kind string) *cobra.Command {
 	promote.Flags().StringVar(&promoteRevision, "revision", "", "imported Revision digest")
 	promote.Flags().BoolVar(&promoteDryRun, "dry-run", false, "preview without writing")
 	group.AddCommand(promote)
+
+	var demoteDeleteProjections, demotePurge, demoteDryRun bool
+	demote := &cobra.Command{
+		Use:   "demote <main/name>",
+		Short: fmt.Sprintf("Move one active %s to archive.", word),
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, arguments []string) error {
+			key, err := artifact.Key(kind, arguments[0])
+			if err != nil {
+				return asDomainError(err)
+			}
+			root, err := brigsbyHome()
+			if err != nil {
+				return err
+			}
+			if !strings.HasPrefix(key, "main/") {
+				return domainErrorf("demote requires main/%s", refName(arguments[0]))
+			}
+			store, registry := artifact.NewStore(root), harness.NewRegistry(root)
+			if _, err := store.Selected(key); err != nil {
+				return err
+			}
+			projections, err := registry.ListProjections()
+			if err != nil {
+				return err
+			}
+			var owned []harness.Projection
+			for _, projection := range projections {
+				if projection.Artifact == key {
+					owned = append(owned, projection)
+				}
+			}
+			if demoteDeleteProjections && !demotePurge {
+				for _, projection := range owned {
+					matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+					if err != nil {
+						return err
+					}
+					if !matches && !mustBeMissing(projection.Path) {
+						return domainErrorf("BLOCKED: Drift %s; rerun with --purge to delete it permanently", projection.Path)
+					}
+				}
+			}
+			archiveKey := "archive/" + kind + "/" + refName(arguments[0])
+			archivePath, err := store.ArtifactPath(archiveKey)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(archivePath); err == nil {
+				return domainErrorf("archive %s already exists", "archive/"+refName(arguments[0]))
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			if demotePurge && !demoteDeleteProjections {
+				return domainErrorf("--purge requires --delete-projections")
+			}
+			if demoteDryRun {
+				targets := []string{mustArtifactPath(store, key), archivePath, filepath.Join(root, "projections.toml")}
+				if demoteDeleteProjections {
+					targets = append(targets, projectionPaths(owned)...)
+				}
+				return emitResult(command.OutOrStdout(), word+" demote", "planned", map[string]any{"delete_projections": demoteDeleteProjections, "from": arguments[0], "projections": len(owned), "purge": demotePurge, "recovery": demoteDeleteProjections && !demotePurge, "targets": targets, "to": "archive/" + refName(arguments[0])})
+			}
+			var batch lifecycle.Batch
+			apply := func() error {
+				if _, err := store.Demote(key); err != nil {
+					return err
+				}
+				if demoteDeleteProjections {
+					for _, projection := range owned {
+						if err := os.RemoveAll(projection.Path); err != nil {
+							return err
+						}
+					}
+				}
+				_, err := registry.ForgetArtifact(key)
+				return err
+			}
+			if demoteDeleteProjections && !demotePurge {
+				targets := append([]lifecycle.Target{{Path: mustArtifactPath(store, key)}, {Path: archivePath}, {Path: filepath.Join(root, "projections.toml")}}, lifecycleTargets(owned)...)
+				var err error
+				batch, err = lifecycle.New(root).Apply(targets, apply)
+				if err != nil {
+					return lifecyclePartialError(batch, err)
+				}
+			} else if err := apply(); err != nil {
+				return err
+			}
+			result := map[string]any{"from": arguments[0], "to": "archive/" + refName(arguments[0]), "projections": len(owned), "delete_projections": demoteDeleteProjections, "purge": demotePurge}
+			if batch.ID != "" {
+				result["recovery_id"] = batch.ID
+			}
+			return emitResult(command.OutOrStdout(), word+" demote", "applied", result)
+		},
+	}
+	demote.Flags().BoolVar(&demoteDeleteProjections, "delete-projections", false, "delete linked Harness copies")
+	demote.Flags().BoolVar(&demotePurge, "purge", false, "delete linked Harness copies without Recovery")
+	demote.Flags().BoolVar(&demoteDryRun, "dry-run", false, "preview without writing")
+	group.AddCommand(demote)
+
+	var deletePurge, deleteDryRun bool
+	deleteCommand := &cobra.Command{
+		Use: "delete <namespace/name>", Short: fmt.Sprintf("Delete one %s and its managed projections.", word), Args: cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, arguments []string) error {
+			key, err := artifact.Key(kind, arguments[0])
+			if err != nil {
+				return asDomainError(err)
+			}
+			root, err := brigsbyHome()
+			if err != nil {
+				return err
+			}
+			store, registry := artifact.NewStore(root), harness.NewRegistry(root)
+			if _, err := store.Selected(key); err != nil {
+				return err
+			}
+			path, err := store.ArtifactPath(key)
+			if err != nil {
+				return err
+			}
+			projections, err := registry.ListProjections()
+			if err != nil {
+				return err
+			}
+			owned := []harness.Projection{}
+			for _, projection := range projections {
+				if projection.Artifact == key {
+					owned = append(owned, projection)
+					if !deletePurge {
+						matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+						if err != nil {
+							return err
+						}
+						if !matches && !mustBeMissing(projection.Path) {
+							return domainErrorf("BLOCKED: Drift %s; rerun with --purge to delete it permanently", projection.Path)
+						}
+					}
+				}
+			}
+			if deleteDryRun {
+				targets := append([]string{path, filepath.Join(root, "projections.toml")}, projectionPaths(owned)...)
+				return emitResult(command.OutOrStdout(), word+" delete", "planned", map[string]any{"deleted": arguments[0], "projections": len(owned), "purge": deletePurge, "recovery": !deletePurge, "targets": targets})
+			}
+			apply := func() error {
+				if err := os.RemoveAll(path); err != nil {
+					return err
+				}
+				for _, projection := range owned {
+					if err := os.RemoveAll(projection.Path); err != nil {
+						return err
+					}
+				}
+				_, err := registry.ForgetArtifact(key)
+				return err
+			}
+			var batch lifecycle.Batch
+			if deletePurge {
+				if err := apply(); err != nil {
+					return err
+				}
+			} else {
+				targets := append([]lifecycle.Target{{Path: path}, {Path: filepath.Join(root, "projections.toml")}}, lifecycleTargets(owned)...)
+				batch, err = lifecycle.New(root).Apply(targets, apply)
+				if err != nil {
+					return lifecyclePartialError(batch, err)
+				}
+			}
+			result := map[string]any{"deleted": arguments[0], "projections": len(owned), "purge": deletePurge}
+			if batch.ID != "" {
+				result["recovery_id"] = batch.ID
+			}
+			return emitResult(command.OutOrStdout(), word+" delete", "applied", result)
+		},
+	}
+	deleteCommand.Flags().BoolVar(&deletePurge, "purge", false, "delete without Recovery")
+	deleteCommand.Flags().BoolVar(&deleteDryRun, "dry-run", false, "preview without writing")
+	group.AddCommand(deleteCommand)
 
 	var showFiles bool
 	show := &cobra.Command{
@@ -1661,9 +1961,13 @@ func writeSyncResults(command *cobra.Command, state string, targets []syncTarget
 			"operation": operation,
 		})
 	}
+	problems := []any{}
+	if state == "applied" {
+		problems = append(problems, recoveryGCProblems()...)
+	}
 	envelope := map[string]any{
 		"state":    state,
-		"problems": []any{},
+		"problems": problems,
 		"result":   results,
 	}
 	if len(operations) > 0 {
@@ -1678,6 +1982,47 @@ func recoveryOperationIDs(operations []recovery.Operation) []string {
 		ids[index] = operation.ID
 	}
 	return ids
+}
+
+func mustBeMissing(path string) bool {
+	_, err := os.Lstat(path)
+	return os.IsNotExist(err)
+}
+
+func projectionPaths(projections []harness.Projection) []string {
+	paths := make([]string, len(projections))
+	for index, projection := range projections {
+		paths[index] = projection.Path
+	}
+	return paths
+}
+
+func lifecycleTargets(projections []harness.Projection) []lifecycle.Target {
+	targets := make([]lifecycle.Target, len(projections))
+	for index, projection := range projections {
+		targets[index] = lifecycle.Target{Path: projection.Path}
+	}
+	return targets
+}
+
+func mustArtifactPath(store artifact.Store, key string) string {
+	path, _ := store.ArtifactPath(key)
+	return path
+}
+
+func lifecyclePartialError(batch lifecycle.Batch, cause error) error {
+	if batch.ID == "" {
+		return cause
+	}
+	return partialError{batchID: batch.ID, err: cause}
+}
+
+func removeWithRecovery(root, path string) (recovery.Operation, error) {
+	plan, err := recovery.PlanRemoval(path)
+	if err != nil {
+		return recovery.Operation{}, err
+	}
+	return recovery.New(root).Apply(plan)
 }
 
 func unownedSkills(skillsPath string, owned map[string]struct{}) ([]string, error) {

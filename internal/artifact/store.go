@@ -112,6 +112,45 @@ type Store struct{ root string }
 // NewStore creates a no-write canonical Artifact store.
 func NewStore(root string) Store { return Store{root: root} }
 
+// ArtifactPath returns the on-disk directory for one selected Artifact.
+func (s Store) ArtifactPath(selector string) (string, error) {
+	parts := strings.Split(selector, "/")
+	if len(parts) != 3 || (parts[1] != KindSkill && parts[1] != KindInstruction) {
+		return "", fmt.Errorf("invalid Artifact selector %q", selector)
+	}
+	return s.artifactDir(parts[0], parts[1], parts[2]), nil
+}
+
+// Demote moves an active main Artifact into archive without changing its
+// revision history. Existing archive identities are never merged implicitly.
+func (s Store) Demote(selector string) (Revision, error) {
+	parts := strings.Split(selector, "/")
+	if len(parts) != 3 || parts[0] != "main" || (parts[1] != KindSkill && parts[1] != KindInstruction) {
+		return Revision{}, fmt.Errorf("demotion requires a main skill or instruction selector")
+	}
+	selected, err := s.Selected(selector)
+	if err != nil {
+		return Revision{}, err
+	}
+	source := s.artifactDir("main", parts[1], parts[2])
+	destination := s.artifactDir("archive", parts[1], parts[2])
+	if _, err := os.Stat(destination); err == nil {
+		return Revision{}, fmt.Errorf("archive Artifact %q already exists", "archive/"+parts[2])
+	} else if !os.IsNotExist(err) {
+		return Revision{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return Revision{}, err
+	}
+	if err := os.Rename(source, destination); err != nil {
+		return Revision{}, err
+	}
+	if err := s.writeArtifact(parts[1], destination, "archive", parts[2], selected.Digest); err != nil {
+		return Revision{}, err
+	}
+	return Revision{Selector: "archive/" + parts[1] + "/" + parts[2], Digest: selected.Digest}, nil
+}
+
 // artifactDir is the on-disk directory for one canonical unit. The layout is
 // kind-first: <root>/<kind>/<namespace>/<name>.
 func (s Store) artifactDir(namespace, kind, name string) string {

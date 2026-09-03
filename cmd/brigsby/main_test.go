@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/CapedHero/brigsby/internal/artifact"
 	"github.com/CapedHero/brigsby/internal/harness"
+	"github.com/CapedHero/brigsby/internal/lifecycle"
 	"github.com/CapedHero/brigsby/internal/recovery"
 )
 
@@ -1672,6 +1675,100 @@ func TestHarnessStatusReportsMissingProjectionWithRestoreCommand(t *testing.T) {
 	arguments, err := os.ReadFile(argumentsPath)
 	if err != nil || string(arguments) != "sync\n--skill\nmain/release-notes\n--harness\ncodex\n" {
 		t.Fatalf("shell remedy arguments = %q, err=%v", arguments, err)
+	}
+}
+
+func TestSkillDeleteRestoresOneLifecycleBatch(t *testing.T) {
+	home := t.TempDir()
+	skills := filepath.Join(home, ".agents", "skills")
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"skill", "add", source}, {"sync", "--harness", "codex", "--skill", "main/release-notes"}} {
+		if code, _, stderr := execCLI(t, arguments...); code != 0 {
+			t.Fatalf("%v exit=%d stderr=%s", arguments, code, stderr)
+		}
+	}
+	deleted := mustCLI(t, "skill", "delete", "main/release-notes")
+	var result struct {
+		RecoveryID string `json:"recovery_id"`
+	}
+	deleted.into(t, &result)
+	if result.RecoveryID == "" {
+		t.Fatalf("delete result = %s, want one lifecycle recovery_id", deleted.Result)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "release-notes")); !os.IsNotExist(err) {
+		t.Fatalf("deleted projection exists: %v", err)
+	}
+	if _, err := artifact.NewStore(filepath.Join(home, ".brigsby")).Selected("main/skills/release-notes"); !os.IsNotExist(err) {
+		t.Fatalf("deleted canonical exists: %v", err)
+	}
+	mustCLI(t, "recovery", "restore", result.RecoveryID)
+	if _, err := os.Stat(filepath.Join(skills, "release-notes", "SKILL.md")); err != nil {
+		t.Fatalf("restored projection: %v", err)
+	}
+	if _, err := artifact.NewStore(filepath.Join(home, ".brigsby")).Selected("main/skills/release-notes"); err != nil {
+		t.Fatalf("restored canonical: %v", err)
+	}
+	var statusOut, statusErr bytes.Buffer
+	if got := run([]string{"status"}, &statusOut, &statusErr); got != 0 {
+		t.Fatalf("status after restore exit=%d stderr=%s", got, statusErr.String())
+	}
+	_, status := decodeStatus(t, statusOut.Bytes())
+	if status.projectionStatus("codex", "skill:main/release-notes") != "projected" {
+		t.Fatalf("restored status = %+v", status)
+	}
+}
+
+func TestLifecyclePartialErrorReportsRecoveryID(t *testing.T) {
+	result := machineResult("", lifecyclePartialError(lifecycle.Batch{ID: "lifecycle-test"}, errors.New("remove projection")))
+	if result["state"] != "partial" {
+		t.Fatalf("state = %v, want partial", result["state"])
+	}
+	value, ok := result["result"].(map[string]any)
+	if !ok || value["recovery_id"] != "lifecycle-test" {
+		t.Fatalf("result = %#v, want recovery_id", result["result"])
+	}
+	problems, ok := result["problems"].([]map[string]any)
+	if !ok || len(problems) != 1 || problems[0]["code"] != "partial" {
+		t.Fatalf("problems = %#v, want one partial problem", result["problems"])
+	}
+}
+
+func TestSkillDeleteDryRunNamesEveryTarget(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "release-notes")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "SKILL.md"), []byte("# Release notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("BRIGSBY_HOME", filepath.Join(home, ".brigsby"))
+	if err := os.MkdirAll(filepath.Join(home, ".agents", "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{{"harness", "link", "codex"}, {"skill", "add", source}, {"sync", "--harness", "codex", "--skill", "main/release-notes"}} {
+		mustCLI(t, arguments...)
+	}
+	preview := mustCLI(t, "skill", "delete", "main/release-notes", "--dry-run")
+	var result struct {
+		Recovery bool     `json:"recovery"`
+		Targets  []string `json:"targets"`
+	}
+	preview.into(t, &result)
+	if !result.Recovery || len(result.Targets) != 3 {
+		t.Fatalf("delete preview = %s, want recovery and three named targets", preview.Result)
 	}
 }
 

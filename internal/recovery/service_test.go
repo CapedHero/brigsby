@@ -398,14 +398,14 @@ func TestPruneUsesWholeOperationsForTheSizeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if !result.Exceeded {
-		t.Fatal("size prune should warn when the newest operation alone exceeds the limit")
+	if result.Exceeded {
+		t.Fatal("size prune should meet the hard limit when completed operations are eligible")
 	}
 	if _, err := os.Stat(first.BundlePath); !os.IsNotExist(err) {
 		t.Fatalf("oldest bundle after size prune: err = %v, want absent", err)
 	}
-	if _, err := os.Stat(second.BundlePath); err != nil {
-		t.Fatalf("newest bundle after size prune: %v", err)
+	if _, err := os.Stat(second.BundlePath); !os.IsNotExist(err) {
+		t.Fatalf("newest bundle after size prune: err = %v, want absent", err)
 	}
 }
 

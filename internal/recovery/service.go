@@ -501,13 +501,7 @@ func (s Service) Prune(policy Retention, now time.Time) (PruneResult, error) {
 				break
 			}
 		}
-		eligible := 0
-		for _, value := range remaining {
-			if eligibleForPruning(value.state) {
-				eligible++
-			}
-		}
-		if index < 0 || eligible == 1 {
+		if index < 0 {
 			result.Exceeded = true
 			break
 		}
