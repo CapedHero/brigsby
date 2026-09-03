@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -847,7 +848,7 @@ func TestHarnessSyncProjectsStructuredGlobalInstructionsToCodex(t *testing.T) {
 	if env.State != "missing" || status.projectionStatus("main/personal-instructions") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
 		t.Fatalf("status output = %q, want missing Instruction Projection", stdout.String())
 	}
-	if problem := env.Problems[0]; problem.Kind != "instruction" || problem.Ref != "main/personal-instructions" || problem.Remedy != "brigsby sync --instruction main/personal-instructions --harness codex" {
+	if problem := env.Problems[0]; problem.Kind != "instruction" || problem.Ref != "main/personal-instructions" || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --instruction main/personal-instructions --harness codex" || strings.Contains(problem.Message, "brigsby sync") {
 		t.Fatalf("status problem = %+v, want Instruction restore command", problem)
 	}
 }
@@ -1151,6 +1152,28 @@ func TestHarnessSyncBlocksDriftedGlobalInstructionProjection(t *testing.T) {
 	stderr.Reset()
 	if got := run([]string{"sync", "--harness", "codex", "--instruction", "main/personal-instructions", "--force"}, &stdout, &stderr); got != 0 {
 		t.Fatalf("force sync exit=%d stderr=%q", got, stderr.String())
+	}
+	if err := os.WriteFile(filepath.Join(source, "AGENTS.md"), []byte("# Updated guidance\n"), 0o644); err != nil {
+		t.Fatalf("update canonical Instruction: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"instruction", "add", source, "--name", "personal-instructions"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("recapture updated Instruction exit=%d stderr=%q", got, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if got := run([]string{"harness", "status"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("status stale Instruction exit=%d stderr=%q", got, stderr.String())
+	}
+	env, status := decodeStatus(t, stdout.Bytes())
+	if env.State != "stale" || status.projectionStatus("main/personal-instructions") != "stale" || len(env.Problems) != 2 {
+		t.Fatalf("status stale Instruction = %s", stdout.String())
+	}
+	for _, problem := range env.Problems {
+		if problem.Kind == "instruction" && (problem.Remedy != nil || !strings.Contains(problem.Message, "review before a force sync")) {
+			t.Fatalf("stale Instruction problem = %+v, want review without executable remedy", problem)
+		}
 	}
 }
 
@@ -1616,8 +1639,31 @@ func TestHarnessStatusReportsMissingProjectionWithRestoreCommand(t *testing.T) {
 		t.Fatalf("status output = %q, want missing projection", stdout.String())
 	}
 	problem := env.Problems[0]
-	if problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "is missing") {
+	if problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "is missing") || strings.Contains(problem.Message, "brigsby sync") {
 		t.Fatalf("status problem = %+v, want self-contained missing details and restore command", problem)
+	}
+	commandDirectory := t.TempDir()
+	argumentsPath := filepath.Join(commandDirectory, "arguments")
+	shim := filepath.Join(commandDirectory, "brigsby")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BRIGSBY_REMEDY_ARGUMENTS\"\n"), 0o755); err != nil {
+		t.Fatalf("write remedy shell shim: %v", err)
+	}
+	restore := exec.Command("sh", "-c", problem.Remedy.Command)
+	restore.Env = []string{
+		"BRIGSBY_REMEDY_ARGUMENTS=" + argumentsPath,
+		"PATH=" + commandDirectory + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	for _, environment := range os.Environ() {
+		if !strings.HasPrefix(environment, "PATH=") && !strings.HasPrefix(environment, "BRIGSBY_REMEDY_ARGUMENTS=") {
+			restore.Env = append(restore.Env, environment)
+		}
+	}
+	if output, err := restore.CombinedOutput(); err != nil {
+		t.Fatalf("run missing-projection remedy: %v\n%s", err, output)
+	}
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil || string(arguments) != "sync\n--skill\nmain/release-notes\n--harness\ncodex\n" {
+		t.Fatalf("shell remedy arguments = %q, err=%v", arguments, err)
 	}
 }
 
@@ -1742,7 +1788,7 @@ func TestHarnessStatusReportsStaleProjectionWhenSelectedRevisionChanges(t *testi
 	if env.State != "stale" || status.projectionStatus("main/release-notes") != "stale" || !slices.Contains(env.problemCodes(), "projection_stale") {
 		t.Fatalf("status output = %q, want stale Projection after selected Revision changed", stdout.String())
 	}
-	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "stale but unchanged") {
+	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "stale but unchanged") || strings.Contains(problem.Message, "brigsby sync") {
 		t.Fatalf("status problem = %+v, want self-contained stale details and update command", problem)
 	}
 }
@@ -2407,14 +2453,18 @@ type cliEnvelope struct {
 }
 
 type cliProblem struct {
-	ID      string `json:"id"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Harness string `json:"harness"`
-	Kind    string `json:"kind"`
-	Path    string `json:"path"`
-	Ref     string `json:"ref"`
-	Remedy  string `json:"remedy"`
+	ID      string     `json:"id"`
+	Code    string     `json:"code"`
+	Message string     `json:"message"`
+	Harness string     `json:"harness"`
+	Kind    string     `json:"kind"`
+	Path    string     `json:"path"`
+	Ref     string     `json:"ref"`
+	Remedy  *cliRemedy `json:"remedy"`
+}
+
+type cliRemedy struct {
+	Command string `json:"command"`
 }
 
 // execCLI runs one invocation and returns its exit code, the decoded stdout
@@ -2426,6 +2476,7 @@ func execCLI(t *testing.T, arguments ...string) (int, cliEnvelope, string) {
 	code := run(arguments, &stdout, &stderr)
 	var envelope cliEnvelope
 	if stdout.Len() > 0 {
+		assertJSONKeysSorted(t, stdout.Bytes())
 		if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 			t.Fatalf("brigsby %s: stdout is not one JSON envelope: %v\n%s", strings.Join(arguments, " "), err, stdout.String())
 		}
@@ -2454,11 +2505,85 @@ func (e cliEnvelope) into(t *testing.T, target any) {
 // decodeEnvelope parses one stdout blob into the canonical envelope.
 func decodeEnvelope(t *testing.T, raw []byte) cliEnvelope {
 	t.Helper()
+	assertJSONKeysSorted(t, raw)
 	var envelope cliEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		t.Fatalf("decode envelope: %v\n%s", err, raw)
 	}
 	return envelope
+}
+
+func TestEncodeCanonicalJSONSortsNestedObjectKeys(t *testing.T) {
+	var output bytes.Buffer
+	value := map[string]any{
+		"zeta":  "z",
+		"alpha": "a",
+		"nested": map[string]any{
+			"zeta":  "z",
+			"alpha": "a",
+			"":      "empty key is still a key",
+		},
+	}
+	if err := encodeCanonicalJSON(&output, value); err != nil {
+		t.Fatalf("encode canonical JSON: %v", err)
+	}
+	assertJSONKeysSorted(t, output.Bytes())
+}
+
+// assertJSONKeysSorted verifies lexical key order recursively, rather than
+// merely decoding the output (which would discard its presentation order).
+func assertJSONKeysSorted(t *testing.T, raw []byte) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	assertJSONValueKeysSorted(t, decoder)
+	if _, err := decoder.Token(); err != io.EOF {
+		t.Fatalf("unexpected extra JSON value: %v in %s", err, raw)
+	}
+}
+
+func assertJSONValueKeysSorted(t *testing.T, decoder *json.Decoder) {
+	t.Helper()
+	token, err := decoder.Token()
+	if err != nil {
+		t.Fatalf("read JSON token: %v", err)
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return
+	}
+	switch delimiter {
+	case '{':
+		previous := ""
+		hasPrevious := false
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				t.Fatalf("read JSON key: %v", err)
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				t.Fatalf("JSON object key = %T, want string", keyToken)
+			}
+			if hasPrevious && key < previous {
+				t.Fatalf("JSON object keys are not sorted: %q before %q", previous, key)
+			}
+			previous = key
+			hasPrevious = true
+			assertJSONValueKeysSorted(t, decoder)
+		}
+		if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+			t.Fatalf("close JSON object = %v, %v", token, err)
+		}
+	case '[':
+		for decoder.More() {
+			assertJSONValueKeysSorted(t, decoder)
+		}
+		if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+			t.Fatalf("close JSON array = %v, %v", token, err)
+		}
+	default:
+		t.Fatalf("unexpected JSON delimiter %q", delimiter)
+	}
 }
 
 // decodeEnvelopeResult parses one stdout blob and decodes its result into target.

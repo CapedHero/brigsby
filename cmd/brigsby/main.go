@@ -1169,18 +1169,21 @@ func newHarnessCommand() *cobra.Command {
 					case missing:
 						missingCount++
 						entry["status"] = "missing"
-						remedy := projectionSyncCommand(projection, candidate.ID)
-						problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s. Restore it with: %s", displayContent(projection.Artifact), candidate.ID, projection.Path, remedy), candidate.ID, projection)
-						problem["remedy"] = remedy
+						problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
+						problem["remedy"] = projectionRemedy(projection, candidate.ID)
 						problems = append(problems, problem)
 					case matches && selected.Digest == projection.Revision:
 						entry["status"] = "projected"
 					case matches:
 						staleCount++
 						entry["status"] = "stale"
-						remedy := projectionSyncCommand(projection, candidate.ID)
-						problem := projectionProblem(fmt.Sprintf("stale-%02d", staleCount), "projection_stale", fmt.Sprintf("Projected %s in %s at %s is stale but unchanged. Update it with: %s", displayContent(projection.Artifact), candidate.ID, projection.Path, remedy), candidate.ID, projection)
-						problem["remedy"] = remedy
+						message := fmt.Sprintf("Projected %s in %s at %s is stale but unchanged.", displayContent(projection.Artifact), candidate.ID, projection.Path)
+						problem := projectionProblem(fmt.Sprintf("stale-%02d", staleCount), "projection_stale", message, candidate.ID, projection)
+						if artifact.KeyKind(projection.Artifact) == artifact.KindSkill {
+							problem["remedy"] = projectionRemedy(projection, candidate.ID)
+						} else {
+							problem["message"] = message + " Protected instruction files need review before a force sync."
+						}
 						problems = append(problems, problem)
 					default:
 						driftCount++
@@ -1530,12 +1533,21 @@ func projectionProblemFields(harnessID string, projection harness.Projection) ma
 	}
 }
 
-func projectionSyncCommand(projection harness.Projection, harnessID string) string {
+// projectionRemedy returns a POSIX-shell command for an action the caller may
+// copy, paste, or run with a shell tool. It deliberately does not claim to be
+// an argv contract for direct process execution.
+type remedy struct {
+	Command string `json:"command"`
+}
+
+func projectionRemedy(projection harness.Projection, harnessID string) remedy {
 	flag := "--skill"
 	if artifact.KeyKind(projection.Artifact) == artifact.KindInstruction {
 		flag = "--instruction"
 	}
-	return fmt.Sprintf("brigsby sync %s %s --harness %s", flag, artifact.DisplayRef(projection.Artifact), harnessID)
+	return remedy{
+		Command: fmt.Sprintf("brigsby sync %s %s --harness %s", flag, artifact.DisplayRef(projection.Artifact), harnessID),
+	}
 }
 
 func projectionFor(projections []harness.Projection, harnessID, path string) (harness.Projection, bool) {
