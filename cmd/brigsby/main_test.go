@@ -352,10 +352,10 @@ func TestHarnessStatusAfterRestoreDoesNotReportStaleProjection(t *testing.T) {
 		t.Fatalf("status state = %q, want clean", env.State)
 	}
 	if !slices.Contains(status.linkedIDs(), "codex") {
-		t.Fatalf("status linked = %+v, want codex", status.Linked)
+		t.Fatalf("status harnesses = %+v, want codex", status.Harnesses)
 	}
-	if len(env.Problems) != 0 || len(status.Projections) != 0 {
-		t.Fatalf("status problems=%+v projections=%+v, want none", env.Problems, status.Projections)
+	if len(env.Problems) != 0 || status.projectionCount() != 0 {
+		t.Fatalf("status problems=%+v projections=%+v, want none", env.Problems, status.Harnesses)
 	}
 }
 
@@ -422,8 +422,8 @@ func TestHarnessStatusAfterRestoreReportsUnownedPath(t *testing.T) {
 	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Path != local {
 		t.Fatalf("status problem = %+v, want structured unowned path details", problem)
 	}
-	if slices.Contains(env.problemCodes(), "projection_drift") || len(status.Projections) != 0 {
-		t.Fatalf("status problems=%+v projections=%+v, want unowned only", env.Problems, status.Projections)
+	if slices.Contains(env.problemCodes(), "projection_drift") || status.projectionCount() != 0 {
+		t.Fatalf("status problems=%+v projections=%+v, want unowned only", env.Problems, status.Harnesses)
 	}
 }
 
@@ -650,7 +650,7 @@ func TestHarnessUnlinkRemovesAssociationAndKeepsHarnessFiles(t *testing.T) {
 	if got, want := run([]string{"harness", "status", "--unowned"}, &stdout, &stderr), 0; got != want {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s; stdout = %s", got, want, stderr.String(), stdout.String())
 	}
-	if _, status := decodeStatus(t, stdout.Bytes()); len(status.Linked) != 0 || len(status.Projections) != 0 {
+	if _, status := decodeStatus(t, stdout.Bytes()); len(status.Harnesses) != 0 || status.projectionCount() != 0 {
 		t.Fatalf("status output = %q, want no linked Harness or Projection claim", stdout.String())
 	}
 }
@@ -845,7 +845,7 @@ func TestHarnessSyncProjectsStructuredGlobalInstructionsToCodex(t *testing.T) {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "missing" || status.projectionStatus("main/personal-instructions") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
+	if env.State != "missing" || status.projectionStatus("codex", "instruction:main/personal-instructions") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
 		t.Fatalf("status output = %q, want missing Instruction Projection", stdout.String())
 	}
 	if problem := env.Problems[0]; problem.Kind != "instruction" || problem.Ref != "main/personal-instructions" || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --instruction main/personal-instructions --harness codex" || strings.Contains(problem.Message, "brigsby sync") {
@@ -919,7 +919,7 @@ func TestHarnessStatusExplainsNoLinkedHarnesses(t *testing.T) {
 		t.Fatalf("status exit=%d stdout=%q stderr=%q", got, stdout.String(), stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "clean" || len(status.Linked) != 0 || len(env.Problems) != 0 {
+	if env.State != "clean" || len(status.Harnesses) != 0 || len(env.Problems) != 0 {
 		t.Fatalf("status = %q, want clean with no linked Harnesses", stdout.String())
 	}
 }
@@ -1167,7 +1167,7 @@ func TestHarnessSyncBlocksDriftedGlobalInstructionProjection(t *testing.T) {
 		t.Fatalf("status stale Instruction exit=%d stderr=%q", got, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "stale" || status.projectionStatus("main/personal-instructions") != "stale" || len(env.Problems) != 2 {
+	if env.State != "stale" || status.projectionStatus("codex", "instruction:main/personal-instructions") != "stale" || len(env.Problems) != 2 {
 		t.Fatalf("status stale Instruction = %s", stdout.String())
 	}
 	for _, problem := range env.Problems {
@@ -1546,7 +1546,7 @@ func TestHarnessStatusReportsCleanProjectionAfterSync(t *testing.T) {
 	if env.State != "clean" || !slices.Contains(status.linkedIDs(), "codex") {
 		t.Fatalf("status output = %q, want clean linked Harness", stdout.String())
 	}
-	if status.projectionStatus("main/release-notes") != "projected" || len(env.Problems) != 0 {
+	if status.projectionStatus("codex", "skill:main/release-notes") != "projected" || len(env.Problems) != 0 {
 		t.Fatalf("status output = %q, want a clean Projection with no problems", stdout.String())
 	}
 }
@@ -1635,8 +1635,16 @@ func TestHarnessStatusReportsMissingProjectionWithRestoreCommand(t *testing.T) {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "missing" || status.projectionStatus("main/release-notes") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
+	if env.State != "missing" || status.projectionStatus("codex", "skill:main/release-notes") != "missing" || !slices.Contains(env.problemCodes(), "projection_missing") {
 		t.Fatalf("status output = %q, want missing projection", stdout.String())
+	}
+	harness, found := status.Harnesses["codex"]
+	if !found {
+		t.Fatalf("status harnesses = %+v, want keyed codex result", status.Harnesses)
+	}
+	projection, found := harness.Projections["skill:main/release-notes"]
+	if !found || projection.Problem == nil || projection.Problem.Code != "projection_missing" || projection.Problem.Remedy == nil {
+		t.Fatalf("status projection = %+v, want keyed missing problem", projection)
 	}
 	problem := env.Problems[0]
 	if problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "is missing") || strings.Contains(problem.Message, "brigsby sync") {
@@ -1701,11 +1709,14 @@ func TestHarnessStatusReportsDriftAfterProjectedSkillIsEdited(t *testing.T) {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "drifted" || status.projectionStatus("main/release-notes") != "drift" {
+	if env.State != "drifted" || status.projectionStatus("codex", "skill:main/release-notes") != "drift" {
 		t.Fatalf("status output = %q, want Drift for the projected Skill", stdout.String())
 	}
 	if !slices.Contains(env.problemCodes(), "projection_drift") {
 		t.Fatalf("status problems = %+v, want a projection_drift problem", env.Problems)
+	}
+	if projection, found := status.projection("codex", "skill:main/release-notes"); !found || projection.Problem == nil || projection.Problem.Code != "projection_drift" {
+		t.Fatalf("keyed drift projection = %+v, found=%t", projection, found)
 	}
 	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || !strings.Contains(problem.Message, "differs from its recorded content") {
 		t.Fatalf("status problem = %+v, want self-contained drift details", problem)
@@ -1742,7 +1753,7 @@ func TestHarnessStatusReportsUnownedLocalSkill(t *testing.T) {
 	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Path != skills {
 		t.Fatalf("status problem = %+v, want structured unowned path details", problem)
 	}
-	if len(status.Projections) != 0 || slices.Contains(env.problemCodes(), "projection_drift") {
+	if status.projectionCount() != 0 || slices.Contains(env.problemCodes(), "projection_drift") {
 		t.Fatalf("status output = %q, want Unowned path without Projection or Drift", stdout.String())
 	}
 }
@@ -1785,11 +1796,14 @@ func TestHarnessStatusReportsStaleProjectionWhenSelectedRevisionChanges(t *testi
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
-	if env.State != "stale" || status.projectionStatus("main/release-notes") != "stale" || !slices.Contains(env.problemCodes(), "projection_stale") {
+	if env.State != "stale" || status.projectionStatus("codex", "skill:main/release-notes") != "stale" || !slices.Contains(env.problemCodes(), "projection_stale") {
 		t.Fatalf("status output = %q, want stale Projection after selected Revision changed", stdout.String())
 	}
 	if problem := env.Problems[0]; problem.Harness != "codex" || problem.Kind != "skill" || problem.Ref != "main/release-notes" || problem.Path != filepath.Join(skills, "release-notes") || problem.Remedy == nil || problem.Remedy.Command != "brigsby sync --skill main/release-notes --harness codex" || !strings.Contains(problem.Message, "stale but unchanged") || strings.Contains(problem.Message, "brigsby sync") {
 		t.Fatalf("status problem = %+v, want self-contained stale details and update command", problem)
+	}
+	if projection, found := status.projection("codex", "skill:main/release-notes"); !found || projection.Problem == nil || projection.Problem.Code != "projection_stale" || projection.Problem.Remedy == nil {
+		t.Fatalf("keyed stale projection = %+v, found=%t", projection, found)
 	}
 }
 
@@ -2621,21 +2635,22 @@ func (e cliEnvelope) problemText() string {
 	return strings.Join(parts, "\n")
 }
 
-// statusResult mirrors `harness status` result.{linked,projections}.
+// statusResult mirrors `harness status` result.harnesses.
 type statusResult struct {
-	Linked []struct {
-		ID         string `json:"id"`
-		Harness    string `json:"harness"`
-		SkillsPath string `json:"skills_path"`
-	} `json:"linked"`
-	Projections []struct {
-		Harness  string `json:"harness"`
-		Kind     string `json:"kind"`
-		Ref      string `json:"ref"`
-		Revision string `json:"revision"`
-		Path     string `json:"path"`
-		Status   string `json:"status"`
-	} `json:"projections"`
+	Harnesses map[string]statusHarness `json:"harnesses"`
+}
+
+type statusHarness struct {
+	Name        string                      `json:"name"`
+	SkillsPath  string                      `json:"skills_path"`
+	Projections map[string]statusProjection `json:"projections"`
+}
+
+type statusProjection struct {
+	Revision string      `json:"revision"`
+	Path     string      `json:"path"`
+	Status   string      `json:"status"`
+	Problem  *cliProblem `json:"problem"`
 }
 
 func decodeStatus(t *testing.T, raw []byte) (cliEnvelope, statusResult) {
@@ -2647,20 +2662,36 @@ func decodeStatus(t *testing.T, raw []byte) (cliEnvelope, statusResult) {
 }
 
 func (s statusResult) linkedIDs() []string {
-	ids := make([]string, len(s.Linked))
-	for index, linked := range s.Linked {
-		ids[index] = linked.ID
+	ids := make([]string, 0, len(s.Harnesses))
+	for id := range s.Harnesses {
+		ids = append(ids, id)
 	}
 	return ids
 }
 
-// projectionStatus returns the reported status for one Skill/Instruction's
-// Projection, or "" when status has none. ref is "namespace/name".
-func (s statusResult) projectionStatus(ref string) string {
-	for _, projection := range s.Projections {
-		if projection.Ref == ref {
-			return projection.Status
-		}
+func (s statusResult) projectionCount() int {
+	count := 0
+	for _, harness := range s.Harnesses {
+		count += len(harness.Projections)
+	}
+	return count
+}
+
+// projection returns one exact, kind-qualified projection for a linked
+// Harness. key is "skill:namespace/name" or "instruction:namespace/name".
+func (s statusResult) projection(harnessID, key string) (statusProjection, bool) {
+	harness, found := s.Harnesses[harnessID]
+	if !found {
+		return statusProjection{}, false
+	}
+	projection, found := harness.Projections[key]
+	return projection, found
+}
+
+func (s statusResult) projectionStatus(harnessID, key string) string {
+	projection, found := s.projection(harnessID, key)
+	if found {
+		return projection.Status
 	}
 	return ""
 }

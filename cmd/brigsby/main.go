@@ -370,6 +370,12 @@ func displayContent(key string) string {
 	return kindWord(key) + " " + artifact.DisplayRef(key)
 }
 
+// projectionStatusKey is the stable, kind-qualified key for a projection in
+// the status result. A Skill and Instruction may share a display reference.
+func projectionStatusKey(key string) string {
+	return kindWord(key) + ":" + artifact.DisplayRef(key)
+}
+
 // refName returns the trailing name segment of a "namespace/name" reference.
 func refName(ref string) string {
 	if slash := strings.LastIndexByte(ref, '/'); slash >= 0 {
@@ -1121,19 +1127,20 @@ func newHarnessCommand() *cobra.Command {
 				return fmt.Errorf("read Projections: %w", err)
 			}
 
-			linkedResult := []map[string]any{}
-			projectionResult := []map[string]any{}
+			harnessesResult := map[string]any{}
 			problems := []map[string]any{}
 			driftCount, missingCount, staleCount, unownedCount := 0, 0, 0, 0
 
 			showManaged := !statusUnowned
 			showUnowned := statusUnowned || statusAll
 			for _, candidate := range linked {
-				linkedResult = append(linkedResult, map[string]any{
-					"id":          candidate.ID,
-					"harness":     candidate.Name,
+				harnessResult := map[string]any{
+					"name":        candidate.Name,
+					"projections": map[string]any{},
 					"skills_path": candidate.SkillsPath,
-				})
+				}
+				harnessesResult[candidate.ID] = harnessResult
+				projectionResult := harnessResult["projections"].(map[string]any)
 				owned := map[string]struct{}{}
 				for _, projection := range projections {
 					if projection.HarnessID != candidate.ID {
@@ -1158,10 +1165,8 @@ func newHarnessCommand() *cobra.Command {
 					if err != nil {
 						return projectionStateErrorf("canonical %s is unavailable: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
 					}
+					projectionKey := projectionStatusKey(projection.Artifact)
 					entry := map[string]any{
-						"harness":  candidate.ID,
-						"kind":     kindWord(projection.Artifact),
-						"ref":      artifact.DisplayRef(projection.Artifact),
 						"revision": projection.Revision,
 						"path":     projection.Path,
 					}
@@ -1171,6 +1176,7 @@ func newHarnessCommand() *cobra.Command {
 						entry["status"] = "missing"
 						problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
 						problem["remedy"] = projectionRemedy(projection, candidate.ID)
+						entry["problem"] = problem
 						problems = append(problems, problem)
 					case matches && selected.Digest == projection.Revision:
 						entry["status"] = "projected"
@@ -1184,13 +1190,16 @@ func newHarnessCommand() *cobra.Command {
 						} else {
 							problem["message"] = message + " Protected instruction files need review before a force sync."
 						}
+						entry["problem"] = problem
 						problems = append(problems, problem)
 					default:
 						driftCount++
 						entry["status"] = "drift"
-						problems = append(problems, projectionProblem(fmt.Sprintf("drift-%02d", driftCount), "projection_drift", fmt.Sprintf("Projected %s in %s at %s differs from its recorded content. Inspect it before replacing it.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection))
+						problem := projectionProblem(fmt.Sprintf("drift-%02d", driftCount), "projection_drift", fmt.Sprintf("Projected %s in %s at %s differs from its recorded content. Inspect it before replacing it.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
+						entry["problem"] = problem
+						problems = append(problems, problem)
 					}
-					projectionResult = append(projectionResult, entry)
+					projectionResult[projectionKey] = entry
 				}
 				if !showUnowned {
 					continue
@@ -1199,16 +1208,22 @@ func newHarnessCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				unownedResult := map[string]any{}
 				for _, path := range unowned {
 					unownedCount++
-					problems = append(problems, map[string]any{
+					problem := map[string]any{
 						"id":      fmt.Sprintf("unowned-%02d", unownedCount),
 						"code":    "unowned_path",
 						"harness": candidate.ID,
 						"kind":    "skill",
 						"message": fmt.Sprintf("Skill path %s in %s is not managed by Brigsby.", path, candidate.ID),
 						"path":    path,
-					})
+					}
+					unownedResult[path] = problem
+					problems = append(problems, problem)
+				}
+				if len(unownedResult) > 0 {
+					harnessResult["unowned"] = unownedResult
 				}
 			}
 
@@ -1224,8 +1239,7 @@ func newHarnessCommand() *cobra.Command {
 				state = "unowned"
 			}
 			return emitEnvelope(command.OutOrStdout(), state, problems, map[string]any{
-				"linked":      linkedResult,
-				"projections": projectionResult,
+				"harnesses": harnessesResult,
 			})
 		},
 	}
