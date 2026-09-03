@@ -10,8 +10,9 @@ of content, each with its own command group: `brigsby skill …` and
 Discover candidate Harness installations, link the specific installation the
 Caller wants Brigsby to manage, then inspect status. Discovery and status do
 not claim, overwrite, or synchronize content. When a machine also carries
-Skills Brigsby does not manage, a managed-only status keeps the report to
-projections and their drift.
+Skills Brigsby does not manage, the default status keeps the report to
+Projections and their Drift. Use `--unowned` to inspect only those paths, or
+`--all` to combine both views.
 
 ## Keep local content
 

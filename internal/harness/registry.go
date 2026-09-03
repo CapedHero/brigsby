@@ -44,16 +44,89 @@ func (r Registry) Link(candidate Candidate) error {
 	if err != nil {
 		return err
 	}
-	for _, linked := range current.Harnesses {
+	legacyID, migratesLegacyPersonal := legacyPersonalID(candidate)
+	canonicalIndex := -1
+	legacyIndex := -1
+	for index, linked := range current.Harnesses {
 		if linked.ID == candidate.ID {
 			if linked != candidate {
 				return fmt.Errorf("linked Harness ID %q already refers to a different installation", candidate.ID)
 			}
-			return nil
+			canonicalIndex = index
+		}
+		if migratesLegacyPersonal && linked.ID == legacyID && linked.Name == candidate.Name && linked.SkillsPath == candidate.SkillsPath {
+			legacyIndex = index
 		}
 	}
-	current.Harnesses = append(current.Harnesses, candidate)
+	if legacyIndex == -1 {
+		if canonicalIndex != -1 && migratesLegacyPersonal {
+			return r.migrateLegacyProjections(legacyID, candidate.ID)
+		}
+		if canonicalIndex != -1 {
+			return nil
+		}
+		current.Harnesses = append(current.Harnesses, candidate)
+		return r.write(current)
+	}
+
+	if canonicalIndex == -1 {
+		// Keep the legacy link until the claim migration completes. If a later
+		// write fails, status can still associate the old claims with this path
+		// and a repeated link completes the migration.
+		current.Harnesses = append(current.Harnesses, candidate)
+		if err := r.write(current); err != nil {
+			return err
+		}
+	}
+	if err := r.migrateLegacyProjections(legacyID, candidate.ID); err != nil {
+		return err
+	}
+	current.Harnesses = append(current.Harnesses[:legacyIndex], current.Harnesses[legacyIndex+1:]...)
 	return r.write(current)
+}
+
+func legacyPersonalID(candidate Candidate) (string, bool) {
+	if candidate.ID != candidate.Name || !supportedHarness(candidate.Name) {
+		return "", false
+	}
+	return candidate.Name + "-personal", true
+}
+
+func (r Registry) migrateLegacyProjections(legacyID, canonicalID string) error {
+	projections, err := r.readProjections()
+	if err != nil {
+		return err
+	}
+	canonicalByPath := make(map[string]Projection, len(projections.Projections))
+	for _, projection := range projections.Projections {
+		if projection.HarnessID == canonicalID {
+			canonicalByPath[projection.Path] = projection
+		}
+	}
+	changed := false
+	kept := projections.Projections[:0]
+	for _, projection := range projections.Projections {
+		if projection.HarnessID != legacyID {
+			kept = append(kept, projection)
+			continue
+		}
+		if existing, found := canonicalByPath[projection.Path]; found {
+			projection.HarnessID = canonicalID
+			if existing != projection {
+				return fmt.Errorf("legacy Projection %q conflicts with canonical Projection claim", projection.Path)
+			}
+			changed = true
+			continue
+		}
+		projection.HarnessID = canonicalID
+		kept = append(kept, projection)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	projections.Projections = kept
+	return r.writeProjections(projections)
 }
 
 func supportedHarness(name string) bool {

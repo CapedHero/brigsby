@@ -408,7 +408,7 @@ func TestHarnessStatusAfterRestoreReportsUnownedPath(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
+	if got, want := run([]string{"harness", "status", "--unowned"}, &stdout, &stderr), 0; got != want {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s; stdout = %s", got, want, stderr.String(), stdout.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
@@ -643,7 +643,7 @@ func TestHarnessUnlinkRemovesAssociationAndKeepsHarnessFiles(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
+	if got, want := run([]string{"harness", "status", "--unowned"}, &stdout, &stderr), 0; got != want {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s; stdout = %s", got, want, stderr.String(), stdout.String())
 	}
 	if _, status := decodeStatus(t, stdout.Bytes()); len(status.Linked) != 0 || len(status.Projections) != 0 {
@@ -1573,7 +1573,7 @@ func TestHarnessStatusReportsUnownedLocalSkill(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got, want := run([]string{"harness", "status"}, &stdout, &stderr), 0; got != want {
+	if got, want := run([]string{"harness", "status", "--unowned"}, &stdout, &stderr), 0; got != want {
 		t.Fatalf("status exit code = %d, want %d; stderr = %s", got, want, stderr.String())
 	}
 	env, status := decodeStatus(t, stdout.Bytes())
@@ -2582,7 +2582,7 @@ func TestArtifactAddNotesUntrackedLinkedHarnessSource(t *testing.T) {
 	}
 }
 
-func TestHarnessStatusManagedOmitsUnownedPaths(t *testing.T) {
+func TestHarnessStatusDefaultsToManagedAndCanShowUnownedOrAll(t *testing.T) {
 	home := t.TempDir()
 	skills := filepath.Join(home, ".agents", "skills", "release-notes")
 	if err := os.MkdirAll(skills, 0o755); err != nil {
@@ -2602,8 +2602,8 @@ func TestHarnessStatusManagedOmitsUnownedPaths(t *testing.T) {
 	if got, want := run([]string{"harness", "status"}, &plainOut, &plainErr), 0; got != want {
 		t.Fatalf("plain status exit code = %d, want %d; stderr = %s", got, want, plainErr.String())
 	}
-	if plainEnv := decodeEnvelope(t, plainOut.Bytes()); plainEnv.State != "unowned" || !slices.Contains(plainEnv.problemCodes(), "unowned_path") {
-		t.Fatalf("plain status output = %q, want an Unowned path", plainOut.String())
+	if plainEnv := decodeEnvelope(t, plainOut.Bytes()); plainEnv.State != "clean" || slices.Contains(plainEnv.problemCodes(), "unowned_path") {
+		t.Fatalf("plain status output = %q, want managed-only clean status", plainOut.String())
 	}
 
 	var managedOut, managedErr bytes.Buffer
@@ -2616,6 +2616,22 @@ func TestHarnessStatusManagedOmitsUnownedPaths(t *testing.T) {
 	}
 	if !slices.Contains(managedStatus.linkedIDs(), "codex") {
 		t.Fatalf("managed status = %q, want the linked Harness", managedOut.String())
+	}
+
+	var unownedOut, unownedErr bytes.Buffer
+	if got, want := run([]string{"harness", "status", "--unowned"}, &unownedOut, &unownedErr), 0; got != want {
+		t.Fatalf("unowned status exit code = %d, want %d; stderr = %s; stdout = %s", got, want, unownedErr.String(), unownedOut.String())
+	}
+	if unownedEnv := decodeEnvelope(t, unownedOut.Bytes()); unownedEnv.State != "unowned" || !slices.Contains(unownedEnv.problemCodes(), "unowned_path") {
+		t.Fatalf("unowned status output = %q, want an Unowned path", unownedOut.String())
+	}
+
+	var allOut, allErr bytes.Buffer
+	if got, want := run([]string{"harness", "status", "--all"}, &allOut, &allErr), 0; got != want {
+		t.Fatalf("all status exit code = %d, want %d; stderr = %s; stdout = %s", got, want, allErr.String(), allOut.String())
+	}
+	if allEnv := decodeEnvelope(t, allOut.Bytes()); allEnv.State != "unowned" || !slices.Contains(allEnv.problemCodes(), "unowned_path") {
+		t.Fatalf("all status output = %q, want managed and Unowned paths", allOut.String())
 	}
 }
 

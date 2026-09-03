@@ -470,7 +470,7 @@ func newRootAlias(name string, target []string, short string, configure func(*co
 
 func newStatusRootAlias() *cobra.Command {
 	var harnessID string
-	var managed bool
+	var managed, unowned, all bool
 	alias := newRootAlias("status", []string{"harness", "status"}, "Report linked Harness state.", func(command *cobra.Command, arguments *[]string) {
 		if command.Flags().Changed("harness") {
 			*arguments = append(*arguments, "--harness", harnessID)
@@ -478,9 +478,18 @@ func newStatusRootAlias() *cobra.Command {
 		if managed {
 			*arguments = append(*arguments, "--managed")
 		}
+		if unowned {
+			*arguments = append(*arguments, "--unowned")
+		}
+		if all {
+			*arguments = append(*arguments, "--all")
+		}
 	})
 	alias.Flags().StringVar(&harnessID, "harness", "", "filter by linked Harness installation ID")
-	alias.Flags().BoolVar(&managed, "managed", false, "report only managed Projections and Drift; omit Unowned paths")
+	alias.Flags().BoolVar(&managed, "managed", false, "deprecated: managed status is the default")
+	alias.Flags().BoolVar(&unowned, "unowned", false, "report only Unowned paths")
+	alias.Flags().BoolVar(&all, "all", false, "include managed Projections, Drift, and Unowned paths")
+	_ = alias.Flags().MarkHidden("managed")
 	return alias
 }
 
@@ -1113,12 +1122,15 @@ func newHarnessCommand() *cobra.Command {
 	unlink.Flags().BoolVar(&unlinkDryRun, "dry-run", false, "preview without writing")
 	harnessCommand.AddCommand(unlink)
 	var statusHarness string
-	var statusManaged bool
+	var statusManaged, statusUnowned, statusAll bool
 	status := &cobra.Command{
 		Use:   "status",
-		Short: "Show linked Harness Projections, Drift, and Unowned paths.",
+		Short: "Show managed Harness Projections and Drift.",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, arguments []string) error {
+			if statusUnowned && (statusManaged || statusAll) {
+				return domainErrorf("--unowned cannot be combined with --managed or --all")
+			}
 			root, err := brigsbyHome()
 			if err != nil {
 				return err
@@ -1150,6 +1162,8 @@ func newHarnessCommand() *cobra.Command {
 			problems := []map[string]any{}
 			driftCount, staleCount, unownedCount := 0, 0, 0
 
+			showManaged := !statusUnowned
+			showUnowned := statusUnowned || statusAll
 			for _, candidate := range linked {
 				linkedResult = append(linkedResult, map[string]any{
 					"id":          candidate.ID,
@@ -1162,6 +1176,9 @@ func newHarnessCommand() *cobra.Command {
 						continue
 					}
 					owned[projection.Path] = struct{}{}
+					if !showManaged {
+						continue
+					}
 					matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
 					if err != nil {
 						return fmt.Errorf("fingerprint Projection: %w", err)
@@ -1199,7 +1216,7 @@ func newHarnessCommand() *cobra.Command {
 					}
 					projectionResult = append(projectionResult, entry)
 				}
-				if statusManaged {
+				if !showUnowned {
 					continue
 				}
 				unowned, err := unownedSkills(candidate.SkillsPath, owned)
@@ -1232,7 +1249,10 @@ func newHarnessCommand() *cobra.Command {
 		},
 	}
 	status.Flags().StringVar(&statusHarness, "harness", "", "filter by linked Harness installation ID")
-	status.Flags().BoolVar(&statusManaged, "managed", false, "report only managed Projections and Drift; omit Unowned paths")
+	status.Flags().BoolVar(&statusManaged, "managed", false, "deprecated: managed status is the default")
+	status.Flags().BoolVar(&statusUnowned, "unowned", false, "report only Unowned paths")
+	status.Flags().BoolVar(&statusAll, "all", false, "include managed Projections, Drift, and Unowned paths")
+	_ = status.Flags().MarkHidden("managed")
 	harnessCommand.AddCommand(status)
 	var linkedIDs, skillRefs, instructionRefs []string
 	var force, dryRun bool
