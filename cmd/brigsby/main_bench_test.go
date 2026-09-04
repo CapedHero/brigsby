@@ -10,10 +10,8 @@ import (
 
 func BenchmarkCLIHelp(b *testing.B) {
 	for b.Loop() {
-		command := newRootCommand(io.Discard, io.Discard)
-		command.SetArgs([]string{"--help"})
-		if err := command.Execute(); err != nil {
-			b.Fatal(err)
+		if code := run([]string{"--help"}, io.Discard, io.Discard); code != 0 {
+			b.Fatalf("help exit code = %d", code)
 		}
 	}
 }

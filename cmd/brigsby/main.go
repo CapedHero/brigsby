@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +19,16 @@ import (
 	"github.com/CapedHero/brigsby/internal/lifecycle"
 	"github.com/CapedHero/brigsby/internal/portable"
 	"github.com/CapedHero/brigsby/internal/recovery"
+	"github.com/CapedHero/brigsby/internal/temp"
 	"github.com/itchyny/gojq"
-	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var errMachineInvalid = errors.New("invalid machine output request")
 
 // domainError is an actionable failure discovered while executing a valid
-// command. Unlike Cobra argument and flag errors, it should not be buried
-// beneath root help text.
+// command. Unlike argument and flag errors, it should not be buried beneath
+// root help text.
 type domainError struct{ err error }
 
 func (err domainError) Error() string { return err.err.Error() }
@@ -38,48 +39,409 @@ func domainErrorf(format string, arguments ...any) error {
 	return domainError{err: fmt.Errorf(format, arguments...)}
 }
 
-func asDomainError(err error) error {
-	if err == nil {
-		return nil
-	}
-	return domainError{err: err}
-}
-
-// stateError identifies unreadable canonical state. It is distinct from a
-// request error and from projection drift: the caller did not change the
-// projected content, Brigsby's own recorded source cannot be trusted.
 type stateError struct {
 	err     error
 	context map[string]any
 }
 
-// partialError means a valid lifecycle command changed some state but left one
-// persisted recovery batch that can restore the entire pre-command snapshot.
+func (err stateError) Error() string { return err.err.Error() }
+func (err stateError) Unwrap() error { return err.err }
+func stateErrorf(format string, arguments ...any) error {
+	return stateError{err: fmt.Errorf(format, arguments...)}
+}
+
+func projectionStateErrorf(format string, harnessID string, projection harness.Projection, arguments ...any) error {
+	return stateError{err: fmt.Errorf(format, arguments...), context: map[string]any{
+		"harness": harnessID,
+		"kind":    kindWord(projection.Artifact),
+		"path":    projection.Path,
+		"ref":     artifact.DisplayRef(projection.Artifact),
+	}}
+}
+
+func isStateError(err error) bool { var state stateError; return errors.As(err, &state) }
+
 type partialError struct {
 	batchID string
 	err     error
 }
 
 func (err partialError) Error() string {
-	return fmt.Sprintf("PARTIAL: lifecycle batch %s can be restored with 'brigsby recovery restore %s': %v", err.batchID, err.batchID, err.err)
+	return fmt.Sprintf("PARTIAL: lifecycle batch %s: %v", err.batchID, err.err)
 }
 func (err partialError) Unwrap() error { return err.err }
 
-func (err stateError) Error() string { return err.err.Error() }
-
-func (err stateError) Unwrap() error { return err.err }
-
-func stateErrorf(format string, arguments ...any) error {
-	return stateError{err: fmt.Errorf(format, arguments...)}
+func tryNode(word, kind string) *node {
+	return command("Copy one selected canonical "+word+" to unlinked Harnesses as a tracked temp.", "<namespace/name>", 1, 1, func() (*pflag.FlagSet, leaf) {
+		set := newFlagSet("brigsby " + word + " try")
+		var targets []string
+		set.StringArrayVar(&targets, "to", nil, "discoverable Harness name (repeatable)")
+		id := set.String("id", "", "explicit temp ID")
+		revisionDigest := set.String("revision", "", "stored Revision digest")
+		dryRun := set.Bool("dry-run", false, "preview without writing")
+		return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+			if len(targets) == 0 {
+				return outcome{}, domainErrorf("try requires at least one --to <harness>")
+			}
+			key, err := artifact.Key(kind, pos[0])
+			if err != nil {
+				return outcome{}, asDomainError(err)
+			}
+			root, err := brigsbyHome()
+			if err != nil {
+				return outcome{}, err
+			}
+			store := artifact.NewStore(root)
+			revision, err := store.Selected(key)
+			if err != nil {
+				return outcome{}, fmt.Errorf("read selected %s: %w", word, err)
+			}
+			selectedDigest := revision.Digest
+			if *revisionDigest != "" {
+				revision, err = store.VerifyRevision(key, *revisionDigest)
+				if err != nil {
+					return outcome{}, fmt.Errorf("verify requested %s Revision: %w", word, err)
+				}
+			}
+			candidates, err := discoverBuiltinCandidates()
+			if err != nil {
+				return outcome{}, err
+			}
+			registry := temp.New(root)
+			planned := []map[string]any{}
+			type item struct {
+				record  temp.Record
+				plans   []recovery.Plan
+				cleanup func()
+			}
+			items := []item{}
+			for _, name := range targets {
+				var candidate harness.Candidate
+				found := false
+				for _, candidate0 := range candidates {
+					if candidate0.candidate.Name == name && candidate0.found {
+						candidate, found = candidate0.candidate, true
+						break
+					}
+				}
+				if !found {
+					return outcome{}, fmt.Errorf("BLOCKED: discoverable Harness %q was not found", name)
+				}
+				tempID := *id
+				if tempID == "" {
+					tempID = name + "-" + strings.ReplaceAll(artifact.DisplayRef(key), "/", "-")
+				}
+				if len(targets) > 1 && *id != "" {
+					return outcome{}, domainErrorf("--id requires exactly one --to")
+				}
+				if _, err := registry.Get(tempID); err == nil {
+					return outcome{}, fmt.Errorf("BLOCKED: temp ID %q already exists", tempID)
+				} else if !os.IsNotExist(err) {
+					return outcome{}, err
+				}
+				var sources, paths []string
+				var cleanup func()
+				if kind == artifact.KindSkill {
+					if *revisionDigest != "" && revision.Digest != selectedDigest {
+						prefix, err := store.Prefix(strings.Split(key, "/")[0])
+						if err != nil {
+							return outcome{}, err
+						}
+						if prefix != "" {
+							return outcome{}, domainErrorf("try --revision requires the selected Revision when the Namespace has a rendered Skill prefix")
+						}
+						_, files, err := store.RevisionContentFilesPath(key, revision.Digest)
+						if err != nil {
+							return outcome{}, err
+						}
+						sources = []string{files}
+						paths = []string{filepath.Join(candidate.SkillsPath, refName(pos[0]))}
+						cleanup = func() {}
+					} else {
+						rendered, err := store.RenderSelectedSkill(key)
+						if err != nil {
+							return outcome{}, err
+						}
+						sources = []string{rendered.FilesPath}
+						paths = []string{filepath.Join(candidate.SkillsPath, rendered.Name)}
+						cleanup = rendered.Cleanup
+					}
+				} else {
+					if *revisionDigest != "" && revision.Digest != selectedDigest {
+						return outcome{}, domainErrorf("instruction try --revision currently requires the selected Revision")
+					}
+					rendered, err := store.RenderSelectedInstructions(key, candidate.Name)
+					if err != nil {
+						return outcome{}, err
+					}
+					rootPath, err := instructionRootPath(candidate)
+					if err != nil {
+						return outcome{}, err
+					}
+					sources = []string{rendered.RootPath, rendered.TreePath}
+					paths = []string{rootPath, filepath.Join(candidate.InstructionsPath, "brigsby", refName(pos[0]))}
+					cleanup = rendered.Cleanup
+				}
+				fingerprints := []string{}
+				plans := []recovery.Plan{}
+				for i, target := range paths {
+					if f, e := recovery.Fingerprint(target); e != nil {
+						return outcome{}, e
+					} else if f != "absent" {
+						return outcome{}, fmt.Errorf("BLOCKED: temp destination exists at %s", target)
+					}
+					p, e := recovery.New(root).Plan(target, sources[i])
+					if e != nil {
+						return outcome{}, e
+					}
+					plans = append(plans, p)
+					fingerprints = append(fingerprints, p.ReplacementFingerprint())
+				}
+				items = append(items, item{temp.Record{ID: tempID, Harness: name, Paths: paths, Artifact: key, Revision: revision.Digest, Fingerprints: fingerprints, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, plans, cleanup})
+				planned = append(planned, map[string]any{"id": tempID, "harness": name, "paths": paths, "revision": revision.Digest})
+			}
+			defer func() {
+				for _, x := range items {
+					if x.cleanup != nil {
+						x.cleanup()
+					}
+				}
+			}()
+			if *dryRun {
+				return outcome{command: word + " try", state: "planned", result: planned}, nil
+			}
+			for _, x := range items {
+				for _, plan := range x.plans {
+					if _, err := recovery.New(root).Apply(plan); err != nil {
+						return outcome{}, err
+					}
+				}
+				if err := registry.Add(x.record); err != nil {
+					return outcome{}, err
+				}
+			}
+			return outcome{command: word + " try", state: "applied", result: planned}, nil
+		}
+	})
 }
 
-func isStateError(err error) bool {
-	var state stateError
-	return errors.As(err, &state)
+func tempsNode(word, kind string) *node {
+	return group("Inspect and clean tracked temporary "+word+" copies.", map[string]*node{
+		"list": command("List tracked temporary copies.", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " temps list")
+			harnessName := set.String("harness", "", "filter by Harness")
+			namespace := set.String("namespace", "", "filter by Namespace")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, e := brigsbyHome()
+				if e != nil {
+					return outcome{}, e
+				}
+				records, e := temp.New(root).List()
+				if e != nil {
+					return outcome{}, e
+				}
+				result := []map[string]any{}
+				for _, r := range records {
+					if artifact.KeyKind(r.Artifact) != kind || (*harnessName != "" && r.Harness != *harnessName) || (*namespace != "" && !strings.HasPrefix(r.Artifact, *namespace+"/")) {
+						continue
+					}
+					states := []string{}
+					for i, p := range r.Paths {
+						f, e := recovery.ContentFingerprint(p)
+						if e != nil {
+							return outcome{}, e
+						}
+						s := "unchanged"
+						if f == "absent" {
+							s = "missing"
+						} else if f != r.Fingerprints[i] {
+							s = "drifted"
+						}
+						states = append(states, s)
+					}
+					result = append(result, map[string]any{"id": r.ID, "harness": r.Harness, "ref": artifact.DisplayRef(r.Artifact), "revision": r.Revision, "paths": r.Paths, "state": states})
+				}
+				return outcome{command: word + " temps list", state: "clean", result: map[string]any{"temps": result}}, nil
+			}
+		}),
+		"show": command("Show one tracked temporary copy.", "<temp-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " temps show")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, e := brigsbyHome()
+				if e != nil {
+					return outcome{}, e
+				}
+				r, e := temp.New(root).Get(pos[0])
+				if os.IsNotExist(e) {
+					return outcome{}, domainErrorf("temp %q was not found", pos[0])
+				}
+				if e != nil {
+					return outcome{}, e
+				}
+				if artifact.KeyKind(r.Artifact) != kind {
+					return outcome{}, domainErrorf("temp %q is not a %s", pos[0], word)
+				}
+				return outcome{command: word + " temps show", state: "clean", result: map[string]any{"id": r.ID, "harness": r.Harness, "ref": artifact.DisplayRef(r.Artifact), "revision": r.Revision, "paths": r.Paths, "created_at": r.CreatedAt}}, nil
+			}
+		}),
+		"detach": command("Forget one temp without changing its files.", "<temp-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " temps detach")
+			dry := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, e := brigsbyHome()
+				if e != nil {
+					return outcome{}, e
+				}
+				r, e := temp.New(root).Get(pos[0])
+				if e != nil {
+					return outcome{}, e
+				}
+				if artifact.KeyKind(r.Artifact) != kind {
+					return outcome{}, domainErrorf("temp %q is not a %s", pos[0], word)
+				}
+				if !*dry {
+					e = temp.New(root).Remove(r.ID)
+					if e != nil {
+						return outcome{}, e
+					}
+				}
+				return outcome{command: word + " temps detach", state: mutationState(*dry), result: map[string]any{"detached": r.ID, "paths": r.Paths}}, nil
+			}
+		}),
+		"promote": command("Convert one unchanged temp into a managed Projection.", "<temp-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " temps promote")
+			dry := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, e := brigsbyHome()
+				if e != nil {
+					return outcome{}, e
+				}
+				tr := temp.New(root)
+				r, e := tr.Get(pos[0])
+				if e != nil {
+					return outcome{}, e
+				}
+				if artifact.KeyKind(r.Artifact) != kind {
+					return outcome{}, domainErrorf("temp %q is not a %s", pos[0], word)
+				}
+				linked, e := harness.NewRegistry(root).List()
+				if e != nil {
+					return outcome{}, e
+				}
+				var candidate harness.Candidate
+				found := false
+				for _, x := range linked {
+					if x.ID == r.Harness {
+						candidate = x
+						found = true
+					}
+				}
+				if !found {
+					return outcome{}, fmt.Errorf("BLOCKED: harness_unlinked %q; run 'brigsby harness link %s'", r.Harness, r.Harness)
+				}
+				for i, p := range r.Paths {
+					f, e := recovery.ContentFingerprint(p)
+					if e != nil {
+						return outcome{}, e
+					}
+					if f == "absent" || f != r.Fingerprints[i] {
+						return outcome{}, fmt.Errorf("BLOCKED: temp %q has drifted or is missing", r.ID)
+					}
+				}
+				if !*dry {
+					reg := harness.NewRegistry(root)
+					for i, p := range r.Paths {
+						if e := reg.RecordProjection(harness.Projection{HarnessID: candidate.ID, Path: p, Artifact: r.Artifact, Revision: r.Revision, Fingerprint: r.Fingerprints[i]}); e != nil {
+							return outcome{}, e
+						}
+					}
+					if e := tr.Remove(r.ID); e != nil {
+						return outcome{}, e
+					}
+				}
+				return outcome{command: word + " temps promote", state: mutationState(*dry), result: map[string]any{"promoted": r.ID, "paths": r.Paths}}, nil
+			}
+		}),
+		"delete": command("Remove tracked temps safely.", "<temp-id>", 0, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " temps delete")
+			all := set.Bool("all", false, "remove every matching temp")
+			purge := set.Bool("purge", false, "remove without Recovery")
+			dry := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if *all == (len(pos) == 1) {
+					return outcome{}, domainErrorf("delete requires exactly one temp ID or --all")
+				}
+				root, e := brigsbyHome()
+				if e != nil {
+					return outcome{}, e
+				}
+				rs, e := temp.New(root).List()
+				if e != nil {
+					return outcome{}, e
+				}
+				chosen := []temp.Record{}
+				for _, r := range rs {
+					if artifact.KeyKind(r.Artifact) == kind && (*all || r.ID == pos[0]) {
+						chosen = append(chosen, r)
+					}
+				}
+				if len(chosen) == 0 {
+					return outcome{}, domainErrorf("no matching temps")
+				}
+				removed := []string{}
+				blocked := []map[string]any{}
+				for _, r := range chosen {
+					clean := true
+					for i, p := range r.Paths {
+						f, e := recovery.ContentFingerprint(p)
+						if e != nil {
+							return outcome{}, e
+						}
+						if f != "absent" && f != r.Fingerprints[i] {
+							clean = false
+						}
+					}
+					if !clean {
+						blocked = append(blocked, map[string]any{"id": r.ID, "code": "temp_drift"})
+						continue
+					}
+					if !*dry {
+						for _, p := range r.Paths {
+							if *purge {
+								if e := os.RemoveAll(p); e != nil {
+									return outcome{}, e
+								}
+							} else {
+								plan, e := recovery.PlanRemoval(p)
+								if e != nil {
+									return outcome{}, e
+								}
+								if _, e = recovery.New(root).Apply(plan); e != nil {
+									return outcome{}, e
+								}
+							}
+						}
+						if e := temp.New(root).Remove(r.ID); e != nil {
+							return outcome{}, e
+						}
+					}
+					removed = append(removed, r.ID)
+				}
+				state := mutationState(*dry)
+				if len(blocked) > 0 {
+					state = "blocked"
+				}
+				return outcome{command: word + " temps delete", state: state, problems: blocked, result: map[string]any{"deleted": removed}}, nil
+			}
+		}),
+	})
 }
 
-func projectionStateErrorf(format string, harnessID string, projection harness.Projection, arguments ...any) error {
-	return stateError{err: fmt.Errorf(format, arguments...), context: projectionProblemFields(harnessID, projection)}
+func asDomainError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return domainError{err: err}
 }
 
 // version is the release identity. It stays "dev" for an ordinary `go build`
@@ -124,8 +486,8 @@ func isReleaseVersion(v string) bool {
 	return !pseudoVersionTail.MatchString(v)
 }
 
-// resolveVersion is memoized: newRootCommand runs once per alias invocation and
-// on the benchmarked help path, so the debug.ReadBuildInfo read must not repeat.
+// resolveVersion is memoized: it is consulted on every invocation, including the
+// benchmarked help path, so the debug.ReadBuildInfo read must not repeat.
 var resolveVersion = sync.OnceValue(func() string {
 	biVersion, biOK := "", false
 	if info, ok := debug.ReadBuildInfo(); ok {
@@ -145,25 +507,22 @@ func main() {
 // `help` subcommand, a bare invocation, and `--version` print human text,
 // exactly as every peer CLI does. (`brigsby version` still emits the envelope.)
 func run(arguments []string, stdout, stderr io.Writer) int {
-	root := newRootCommand(stdout, stderr)
-
 	if wantsPlainText(arguments) {
-		root.SetArgs(arguments)
-		if err := root.Execute(); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
-		}
-		return 0
+		return runPlainText(arguments, stdout, stderr)
 	}
 
-	var commandOutput bytes.Buffer
-	root.SetOut(&commandOutput)
-	root.SetArgs(arguments)
-	err := root.Execute()
-	jqExpression, _ := root.PersistentFlags().GetString("jq")
+	rest, jqExpression := extractJQ(arguments)
+	rest = expandAlias(rest)
+	var out outcome
+	var err error
+	if len(rest) > 1 && rest[0] == "harness" && rest[1] == "sync" {
+		err = fmt.Errorf("unknown command %q for %q", "sync", "brigsby harness")
+	} else {
+		out, err = rootNode.route("brigsby", rest, stderr)
+	}
 
 	// stdout always carries exactly one JSON envelope -- the machine contract.
-	result := machineResult(commandOutput.String(), err)
+	result := envelopeFrom(out, rest, err)
 	if outputErr := writeMachineResult(stdout, result, jqExpression); outputErr != nil {
 		return 1
 	}
@@ -178,10 +537,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stderr, err)
 	fmt.Fprintln(stderr)
-	root.SetOut(stderr)
-	if helpErr := root.Help(); helpErr != nil {
-		fmt.Fprintln(stderr, helpErr)
-	}
+	fmt.Fprint(stderr, helpText())
 	return 2
 }
 
@@ -202,18 +558,87 @@ func wantsPlainText(arguments []string) bool {
 	return false
 }
 
-func isBlockedError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "BLOCKED:")
+// runPlainText serves the human affordances: `--version` prints the version
+// line; everything else (`help`, `--help`, `-h`, a bare invocation) prints the
+// usage for the deepest command named on the line, or the root when none is.
+func runPlainText(arguments []string, stdout, stderr io.Writer) int {
+	rest := arguments
+	forceHelp := false
+	if len(rest) > 0 && rest[0] == "help" {
+		forceHelp = true
+		rest = rest[1:]
+	}
+	var path []string
+	for _, argument := range rest {
+		switch {
+		case argument == "--help" || argument == "-h":
+			forceHelp = true
+		case argument == "--version":
+			if !forceHelp {
+				fmt.Fprintf(stdout, "brigsby %s\n", resolveVersion())
+				return 0
+			}
+		case strings.HasPrefix(argument, "-"):
+			// ignore other flags when resolving the help target
+		default:
+			path = append(path, argument)
+		}
+	}
+	target, used := rootNode.find(path)
+	fmt.Fprint(stdout, renderHelp(target, used))
+	return 0
 }
 
-func isDomainError(err error) bool {
-	var domain domainError
-	return isPartialError(err) || isBlockedError(err) || isStateError(err) || errors.As(err, &domain)
+// extractJQ removes the global --jq flag (--jq <expr> or --jq=<expr>) from
+// anywhere in the argument list and returns the cleaned arguments alongside the
+// expression. It is the hand-rolled stand-in for the persistent flag cobra
+// parsed.
+func extractJQ(arguments []string) ([]string, string) {
+	cleaned := make([]string, 0, len(arguments))
+	expression := ""
+	for index := 0; index < len(arguments); index++ {
+		argument := arguments[index]
+		switch {
+		case argument == "--jq":
+			if index+1 < len(arguments) {
+				expression = arguments[index+1]
+				index++
+			}
+		case strings.HasPrefix(argument, "--jq="):
+			expression = strings.TrimPrefix(argument, "--jq=")
+		default:
+			cleaned = append(cleaned, argument)
+		}
+	}
+	return cleaned, expression
+}
+
+// expandAlias rewrites the two root-level convenience aliases to their real
+// command path before routing. `brigsby status` and `brigsby sync` are exactly
+// `brigsby harness status` and `brigsby harness sync`.
+func expandAlias(arguments []string) []string {
+	if len(arguments) == 0 {
+		return arguments
+	}
+	switch arguments[0] {
+	case "status":
+		return append([]string{"harness", "status"}, arguments[1:]...)
+	}
+	return arguments
+}
+
+func isBlockedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "BLOCKED:")
 }
 
 func isPartialError(err error) bool {
 	var partial partialError
 	return errors.As(err, &partial)
+}
+
+func isDomainError(err error) bool {
+	var domain domainError
+	return isPartialError(err) || isBlockedError(err) || isStateError(err) || errors.As(err, &domain)
 }
 
 // canonicalValue re-serialises any value so that every nested object becomes a
@@ -249,30 +674,28 @@ func encodeCanonicalJSON(w io.Writer, v any) error {
 	return err
 }
 
-// machineResult turns one command execution into the canonical envelope. A
-// command that ran to completion has already written its own
-// {state,problems,result} object to output via emitResult; this parses it and
-// guarantees those keys are present. Only a failure that
-// happened before the command could emit -- an unknown command, a bad flag, or
-// a domain/BLOCKED error returned from RunE -- needs an envelope synthesised
-// here.
-func machineResult(output string, commandErr error) map[string]any {
+// envelopeFrom turns one command execution into the canonical envelope. A
+// command that ran to completion returns a populated outcome; this guarantees
+// the three core keys are present. Only a failure -- an unknown command, a bad flag,
+// or a domain/BLOCKED error returned from a leaf -- needs an envelope
+// synthesised here.
+func envelopeFrom(out outcome, arguments []string, commandErr error) map[string]any {
 	result := map[string]any{
 		"state":    "clean",
 		"problems": []any{},
 		"result":   nil,
 	}
-	if commandErr == nil && json.Unmarshal([]byte(output), &result) == nil {
-		if _, found := result["state"]; !found {
-			result["state"] = "clean"
+	if commandErr == nil {
+		if out.state != "" {
+			result["state"] = out.state
 		}
-		for _, key := range []string{"problems", "result"} {
-			if _, found := result[key]; !found {
-				if key == "problems" {
-					result[key] = []any{}
-				} else {
-					result[key] = nil
-				}
+		if out.problems != nil {
+			result["problems"] = out.problems
+		}
+		result["result"] = out.result
+		if preview, ok := out.preview.(map[string]any); ok {
+			if recoveryIDs, ok := preview["recovery_ids"]; ok {
+				result["recovery_ids"] = recoveryIDs
 			}
 		}
 		return result
@@ -283,29 +706,79 @@ func machineResult(output string, commandErr error) map[string]any {
 		code, state = "partial", "partial"
 	case isBlockedError(commandErr):
 		code, state = "blocked", "blocked"
-	case isStateError(commandErr):
-		code = "state_error"
 	case isDomainError(commandErr):
 		code = "domain_error"
 	}
+	if isStateError(commandErr) {
+		code = "state_error"
+	}
 	result["state"] = state
-	if commandErr != nil {
-		problem := map[string]any{"code": code, "message": commandErr.Error()}
-		var stateErr stateError
-		if errors.As(commandErr, &stateErr) {
-			for key, value := range stateErr.context {
-				problem[key] = value
-			}
+	problem := map[string]any{"code": code, "message": commandErr.Error()}
+	var stateErr stateError
+	if errors.As(commandErr, &stateErr) {
+		for key, value := range stateErr.context {
+			problem[key] = value
 		}
-		result["problems"] = []map[string]any{problem}
-		var partial partialError
-		if errors.As(commandErr, &partial) {
-			result["result"] = map[string]any{"recovery_id": partial.batchID}
-		}
-	} else if trimmed := strings.TrimSpace(output); trimmed != "" {
-		result["result"] = map[string]any{"output": trimmed}
+	}
+	result["problems"] = []map[string]any{problem}
+	var partial partialError
+	if errors.As(commandErr, &partial) {
+		result["result"] = map[string]any{"recovery_id": partial.batchID}
 	}
 	return result
+}
+
+// machineResult is retained as the direct envelope helper used by lifecycle
+// tests and callers that need to classify a command failure without routing it.
+func machineResult(_ string, commandErr error) map[string]any {
+	return envelopeFrom(outcome{}, nil, commandErr)
+}
+
+func lifecyclePartialError(batch lifecycle.Batch, cause error) error {
+	if batch.ID == "" {
+		return cause
+	}
+	return partialError{batchID: batch.ID, err: cause}
+}
+
+func commandName(arguments []string) string {
+	arguments = commandArguments(arguments)
+	if len(arguments) == 0 {
+		return "brigsby"
+	}
+	switch arguments[0] {
+	case "status":
+		return "harness status"
+	case "sync":
+		return "harness sync"
+	}
+	command := []string{arguments[0]}
+	if len(arguments) > 1 && !strings.HasPrefix(arguments[1], "-") {
+		switch arguments[0] {
+		case "harness", "skill", "instruction", "namespace", "package", "recovery":
+			command = append(command, arguments[1])
+		}
+	}
+	return strings.Join(command, " ")
+}
+
+func commandArguments(arguments []string) []string {
+	for len(arguments) > 0 {
+		argument := arguments[0]
+		if argument == "--jq" {
+			if len(arguments) < 2 {
+				return nil
+			}
+			arguments = arguments[2:]
+			continue
+		}
+		if strings.HasPrefix(argument, "--jq=") {
+			arguments = arguments[1:]
+			continue
+		}
+		break
+	}
+	return arguments
 }
 
 // writeMachineResult emits the final envelope. Without --jq it is the whole
@@ -317,7 +790,7 @@ func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression st
 		"problems": result["problems"],
 		"result":   result["result"],
 	}
-	if recoveryIDs, found := result["recovery_ids"]; found {
+	if recoveryIDs, ok := result["recovery_ids"]; ok {
 		envelope["recovery_ids"] = recoveryIDs
 	}
 	if jqExpression == "" {
@@ -357,86 +830,6 @@ func writeMachineResult(stdout io.Writer, result map[string]any, jqExpression st
 	return errMachineInvalid
 }
 
-// emitResult is the ordinary way a command reports success: a canonical
-// envelope with no problems. run() re-reads it, applies --jq, and prints the
-// sorted, pretty result.
-func emitResult(out io.Writer, _ string, state string, result any) error {
-	problems := []any{}
-	if state == "applied" {
-		problems = append(problems, recoveryGCProblems()...)
-	}
-	return emitEnvelope(out, state, problems, result)
-}
-
-// recoveryGCProblems applies retention after a committed mutation. Cleanup can
-// fail independently of the mutation, so it is reported without retracting an
-// already-applied result or hiding the recovery ID needed to undo it.
-func recoveryGCProblems() []any {
-	root, err := brigsbyHome()
-	if err != nil {
-		return []any{map[string]any{"code": "gc_failed", "message": err.Error()}}
-	}
-	if _, _, err := pruneRecovery(root, time.Now()); err != nil {
-		return []any{map[string]any{"code": "gc_failed", "message": err.Error()}}
-	}
-	return nil
-}
-
-// pruneRecovery enforces one 16 MiB budget across ordinary Recovery bundles
-// and multi-path lifecycle batches, rather than granting each store its own
-// independent allowance.
-func pruneRecovery(root string, now time.Time) (recovery.PruneResult, recovery.PruneResult, error) {
-	policy := recovery.DefaultRetention()
-	ordinary, err := recovery.New(root).Prune(policy, now)
-	if err != nil {
-		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("garbage collect Recovery: %w", err)
-	}
-	used, err := recoverableBytes(filepath.Join(root, "recovery"))
-	if err != nil {
-		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("measure Recovery retention: %w", err)
-	}
-	lifecyclePolicy := policy
-	lifecyclePolicy.MaxBytes -= used
-	if lifecyclePolicy.MaxBytes < 0 {
-		lifecyclePolicy.MaxBytes = 0
-	}
-	lifecycleResult, err := lifecycle.New(root).Prune(lifecyclePolicy, now)
-	if err != nil {
-		return recovery.PruneResult{}, recovery.PruneResult{}, fmt.Errorf("garbage collect lifecycle: %w", err)
-	}
-	return ordinary, lifecycleResult, nil
-}
-
-func recoverableBytes(root string) (int64, error) {
-	var bytes int64
-	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			bytes += info.Size()
-		}
-		return nil
-	})
-	if os.IsNotExist(err) {
-		return 0, nil
-	}
-	return bytes, err
-}
-
-// emitEnvelope is emitResult for the few commands (harness status) that report
-// their own problem list alongside a result.
-func emitEnvelope(out io.Writer, state string, problems, result any) error {
-	return encodeCanonicalJSON(out, map[string]any{
-		"state":    state,
-		"problems": problems,
-		"result":   result,
-	})
-}
-
 // contentRef is the canonical shape for a Skill or Instruction Revision wherever
 // a result names one: a lower-case, sorted {digest, kind, ref} object. key is
 // the internal store key "namespace/kind/name"; ref renders as "namespace/name".
@@ -458,11 +851,53 @@ func displayContent(key string) string {
 	return kindWord(key) + " " + artifact.DisplayRef(key)
 }
 
-// projectionStatusKey is the stable, kind-qualified key for a projection in
-// the status result. A Skill and Instruction may share a display reference.
+// projectionStatusKey prevents a Skill and an Instruction with the same
+// namespace/name from colliding in a harness's keyed Projection inventory.
 func projectionStatusKey(key string) string {
 	return kindWord(key) + ":" + artifact.DisplayRef(key)
 }
+
+func projectionMissing(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func projectionProblem(id, code, message, harnessID string, projection harness.Projection) map[string]any {
+	return map[string]any{"id": id, "code": code, "message": message, "harness": harnessID, "kind": kindWord(projection.Artifact), "ref": artifact.DisplayRef(projection.Artifact), "path": projection.Path}
+}
+
+type remedy struct {
+	Command string `json:"command"`
+}
+
+func projectionRemedy(projection harness.Projection, harnessID string) remedy {
+	flag := "--skill"
+	if artifact.KeyKind(projection.Artifact) == artifact.KindInstruction {
+		flag = "--instruction"
+	}
+	return remedy{Command: fmt.Sprintf("brigsby sync %s %s --harness %s", flag, artifact.DisplayRef(projection.Artifact), harnessID)}
+}
+
+func lifecycleTargets(projections []harness.Projection) []lifecycle.Target {
+	targets := make([]lifecycle.Target, len(projections))
+	for index, projection := range projections {
+		targets[index] = lifecycle.Target{Path: projection.Path}
+	}
+	return targets
+}
+
+func projectionPaths(projections []harness.Projection) []string {
+	paths := make([]string, len(projections))
+	for index, projection := range projections {
+		paths[index] = projection.Path
+	}
+	return paths
+}
+
+func mustBeMissing(path string) bool { _, err := os.Lstat(path); return os.IsNotExist(err) }
 
 // refName returns the trailing name segment of a "namespace/name" reference.
 func refName(ref string) string {
@@ -481,13 +916,6 @@ func capturedRefs(revisions []artifact.Revision) string {
 	return strings.Join(refs, ", ")
 }
 
-func contentAddLong(word string) string {
-	if word == "instruction" {
-		return "Capture one local Instruction set as an immutable canonical revision. The path is a directory holding an AGENTS.md index, an instructions.toml declaration, and every declared Instruction doc."
-	}
-	return "Capture one or more local Skill directories as immutable canonical revisions. Each path is a directory containing root-level SKILL.md, or a directory whose immediate subdirectories each contain one. Paths may be relative or absolute."
-}
-
 // mutationState maps a --dry-run flag to the envelope state a mutation reports.
 func mutationState(dryRun bool) string {
 	if dryRun {
@@ -496,750 +924,679 @@ func mutationState(dryRun bool) string {
 	return "applied"
 }
 
-func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
-	root := &cobra.Command{
-		Use:           "brigsby",
-		Short:         "Brigsby manages AI coding-agent Artifacts safely.",
-		SilenceErrors: true,
-		SilenceUsage:  true,
-		Version:       resolveVersion(),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			return command.Help()
+// outcome is what a leaf returns on success. run() serialises it into the
+// canonical envelope exactly once; problems/preview stay nil unless a leaf sets
+// them.
+type outcome struct {
+	command  string
+	state    string
+	problems any
+	result   any
+	preview  any
+}
+
+// leaf executes one resolved command. pos holds the positional arguments left
+// after flag parsing; stderr carries human advisories that never enter stdout.
+type leaf func(path string, pos []string, stderr io.Writer) (outcome, error)
+
+// node is one entry in the command tree: a group (subs populated) or an
+// executable command (factory populated). factory returns a fresh flag set plus
+// the closure that runs once the set is parsed, so a single definition serves
+// both execution and `--help` rendering.
+type node struct {
+	short   string
+	argHint string
+	subs    map[string]*node
+	factory func() (*pflag.FlagSet, leaf)
+	minPos  int
+	maxPos  int // -1 means unbounded
+}
+
+// usageError is an invalid invocation: an unknown command, a bad flag, or the
+// wrong number of positional arguments. run() prints it above the root usage
+// and exits 2, matching the old cobra behaviour.
+type usageError struct{ message string }
+
+func (err usageError) Error() string { return err.message }
+
+func usageErrorf(format string, arguments ...any) error {
+	return usageError{message: fmt.Sprintf(format, arguments...)}
+}
+
+func newFlagSet(path string) *pflag.FlagSet {
+	set := pflag.NewFlagSet(path, pflag.ContinueOnError)
+	set.SetOutput(io.Discard) // errors are formatted by route, never by pflag
+	set.Usage = func() {}
+	return set
+}
+
+func group(short string, subs map[string]*node) *node {
+	return &node{short: short, subs: subs}
+}
+
+func command(short, argHint string, minPos, maxPos int, factory func() (*pflag.FlagSet, leaf)) *node {
+	return &node{short: short, argHint: argHint, minPos: minPos, maxPos: maxPos, factory: factory}
+}
+
+// aliasOf clones a target command so it can be reached under a second name for
+// help and discovery; execution is redirected earlier by expandAlias.
+func aliasOf(short string, target *node) *node {
+	clone := *target
+	clone.short = short
+	return &clone
+}
+
+func (n *node) route(path string, args []string, stderr io.Writer) (outcome, error) {
+	if n.factory != nil {
+		set, fn := n.factory()
+		if err := set.Parse(args); err != nil {
+			return outcome{}, usageErrorf("%s: %v", path, err)
+		}
+		pos := set.Args()
+		if n.maxPos == 0 && len(pos) > 0 {
+			return outcome{}, usageErrorf("unknown command %q for %q", pos[0], path)
+		}
+		if len(pos) < n.minPos || (n.maxPos > 0 && len(pos) > n.maxPos) {
+			return outcome{}, usageErrorf("%q: %s", path, arityText(n.minPos, n.maxPos))
+		}
+		return fn(path, pos, stderr)
+	}
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return outcome{}, usageErrorf("%q: subcommand required (one of: %s)", path, strings.Join(sortedKeys(n.subs), ", "))
+	}
+	child, ok := n.subs[args[0]]
+	if !ok {
+		return outcome{}, usageErrorf("unknown command %q for %q", args[0], path)
+	}
+	return child.route(path+" "+args[0], args[1:], stderr)
+}
+
+// find walks as far down the tree as the leading path segments match, returning
+// the node reached and the segments consumed.
+func (n *node) find(path []string) (*node, []string) {
+	current := n
+	used := make([]string, 0, len(path))
+	for _, segment := range path {
+		next, ok := current.subs[segment]
+		if !ok {
+			break
+		}
+		current = next
+		used = append(used, segment)
+	}
+	return current, used
+}
+
+func sortedKeys(m map[string]*node) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func arityText(minPos, maxPos int) string {
+	switch {
+	case maxPos < 0:
+		return fmt.Sprintf("expected at least %d argument(s)", minPos)
+	case minPos == maxPos:
+		return fmt.Sprintf("expected exactly %d argument(s)", minPos)
+	default:
+		return fmt.Sprintf("expected %d to %d arguments", minPos, maxPos)
+	}
+}
+
+// renderHelp produces the plain-text usage for one node. The `Usage:` line
+// keeps the shape peer CLIs (and the first-party Skill contract) expect:
+// "brigsby <path> [flags]" for a command, "brigsby [flags]" plus a "[command]"
+// line for the runnable root, and "brigsby <path> [command]" for a group.
+func renderHelp(n *node, path []string) string {
+	name := strings.Join(append([]string{"brigsby"}, path...), " ")
+	var b strings.Builder
+	if n.short != "" {
+		b.WriteString(n.short + "\n\n")
+	}
+	b.WriteString("Usage:\n")
+	switch {
+	case n.factory != nil:
+		line := "  " + name
+		if n.argHint != "" {
+			line += " " + n.argHint
+		}
+		b.WriteString(line + " [flags]\n")
+	case len(path) == 0:
+		b.WriteString("  " + name + " [flags]\n  " + name + " [command]\n")
+	default:
+		b.WriteString("  " + name + " [command]\n")
+	}
+	if len(n.subs) > 0 {
+		b.WriteString("\nAvailable Commands:\n")
+		for _, key := range sortedKeys(n.subs) {
+			fmt.Fprintf(&b, "  %-13s %s\n", key, n.subs[key].short)
+		}
+	}
+	b.WriteString("\nFlags:\n")
+	if n.factory != nil {
+		set, _ := n.factory()
+		b.WriteString(set.FlagUsages())
+	}
+	if len(path) == 0 {
+		b.WriteString("      --jq string   filter the JSON result with a jq expression\n")
+	}
+	b.WriteString("  -h, --help   help for " + name + "\n")
+	if len(path) == 0 {
+		b.WriteString("      --version   version for brigsby\n")
+	}
+	return b.String()
+}
+
+func helpText() string { return renderHelp(rootNode, nil) }
+
+var rootNode = buildRootNode()
+
+func buildRootNode() *node {
+	harnessGroup := harnessNode()
+	return &node{
+		short: "Brigsby manages AI coding-agent Artifacts safely.",
+		subs: map[string]*node{
+			"version":     versionNode(),
+			"harness":     harnessGroup,
+			"skill":       contentNode("skill", artifact.KindSkill),
+			"instruction": contentNode("instruction", artifact.KindInstruction),
+			"namespace":   namespaceNode(),
+			"package":     packageNode(),
+			"recovery":    recoveryNode(),
+			"status":      aliasOf("Report linked Harness state (alias for harness status).", harnessGroup.subs["status"]),
+			"sync":        aliasOf("Project selected canonical content (alias for harness sync).", harnessGroup.subs["sync"]),
 		},
 	}
-	root.SetOut(stdout)
-	root.SetErr(stderr)
-	root.SetVersionTemplate("brigsby {{.Version}}\n")
-	root.PersistentFlags().String("jq", "", "filter the JSON result with a jq expression")
-	root.AddCommand(&cobra.Command{
-		Use:   "version",
-		Short: "Print the Brigsby version",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			return emitResult(command.OutOrStdout(), "version", "clean", map[string]any{"version": resolveVersion()})
-		},
-	})
-	root.AddCommand(newHarnessCommand())
-	root.AddCommand(newContentCommand("skill", artifact.KindSkill))
-	root.AddCommand(newContentCommand("instruction", artifact.KindInstruction))
-	root.AddCommand(newNamespaceCommand())
-	root.AddCommand(newPackageCommand())
-	root.AddCommand(newRecoveryCommand())
-	root.AddCommand(newGCCommand())
-	root.AddCommand(newStatusRootAlias())
-	root.AddCommand(newSyncCommand())
-	return root
 }
 
-func newGCCommand() *cobra.Command {
-	var dryRun bool
-	command := &cobra.Command{Use: "gc", Short: "Remove expired Brigsby recovery data.", Args: cobra.NoArgs, RunE: func(command *cobra.Command, _ []string) error {
-		root, err := brigsbyHome()
-		if err != nil {
-			return err
-		}
-		if dryRun {
-			return emitResult(command.OutOrStdout(), "gc", "planned", map[string]any{"retention_days": 30})
-		}
-		result, lifecycleResult, err := pruneRecovery(root, time.Now())
-		if err != nil {
-			return err
-		}
-		removed := make([]string, len(result.Removed))
-		for index, operation := range result.Removed {
-			removed[index] = operation.ID
-		}
-		removed = append(removed, recoveryOperationIDs(lifecycleResult.Removed)...)
-		return emitResult(command.OutOrStdout(), "gc", "applied", map[string]any{"reclaimed_bytes": result.ReclaimedBytes + lifecycleResult.ReclaimedBytes, "removed": removed})
-	}}
-	command.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
-	return command
-}
-
-func newRootAlias(name string, target []string, short string, configure func(*cobra.Command, *[]string)) *cobra.Command {
-	alias := &cobra.Command{
-		Use:   name,
-		Short: short,
-		Args:  cobra.ArbitraryArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			aliased := newRootCommand(command.OutOrStdout(), command.ErrOrStderr())
-			aliasedArguments := append(append([]string{}, target...), arguments...)
-			if configure != nil {
-				configure(command, &aliasedArguments)
-			}
-			aliased.SetArgs(aliasedArguments)
-			return aliased.Execute()
-		},
-	}
-	return alias
-}
-
-func newStatusRootAlias() *cobra.Command {
-	var harnessID string
-	var managed, unowned, all bool
-	alias := newRootAlias("status", []string{"harness", "status"}, "Report linked Harness state.", func(command *cobra.Command, arguments *[]string) {
-		if command.Flags().Changed("harness") {
-			*arguments = append(*arguments, "--harness", harnessID)
-		}
-		if managed {
-			*arguments = append(*arguments, "--managed")
-		}
-		if unowned {
-			*arguments = append(*arguments, "--unowned")
-		}
-		if all {
-			*arguments = append(*arguments, "--all")
+func versionNode() *node {
+	return command("Print the Brigsby version", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+		set := newFlagSet("brigsby version")
+		return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+			return outcome{command: "version", state: "clean", result: map[string]any{"version": resolveVersion()}}, nil
 		}
 	})
-	alias.Flags().StringVar(&harnessID, "harness", "", "filter by linked Harness installation ID")
-	alias.Flags().BoolVar(&managed, "managed", false, "deprecated: managed status is the default")
-	alias.Flags().BoolVar(&unowned, "unowned", false, "report only Unowned paths")
-	alias.Flags().BoolVar(&all, "all", false, "include managed Projections, Drift, and Unowned paths")
-	_ = alias.Flags().MarkHidden("managed")
-	return alias
 }
 
-func newPackageCommand() *cobra.Command {
-	packageCommand := &cobra.Command{Use: "package", Short: "Create and inspect portable text-only Packages.", Long: "Create and inspect portable text-only Packages. In v1 a Package carries Skills only; name them with --skill namespace/name."}
-	var output, expect string
-	var replace bool
-	var skillRefs []string
-	create := &cobra.Command{
-		Use:   "create --skill <namespace/name> --output <new-path>",
-		Short: "Create a portable Package from selected Skills.",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if output == "" {
-				return domainErrorf("package create requires --output <absolute-path>")
-			}
-			if len(skillRefs) == 0 {
-				return domainErrorf("package create requires at least one --skill <namespace/name>")
-			}
-			keys := make([]string, 0, len(skillRefs))
-			for _, ref := range skillRefs {
-				key, err := artifact.Key(artifact.KindSkill, ref)
-				if err != nil {
-					return asDomainError(err)
+func namespaceNode() *node {
+	return group("Configure Namespace rendering rules.", map[string]*node{
+		"set-prefix": command("Set a Recovery-backed target-facing Skill prefix.", "<namespace> <prefix>", 2, 2, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby namespace set-prefix")
+			dryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if err := artifact.ValidatePrefix(pos[0], pos[1]); err != nil {
+					return outcome{}, err
 				}
-				keys = append(keys, key)
+				result := map[string]any{"namespace": pos[0], "prefix": pos[1]}
+				if !*dryRun {
+					root, err := brigsbyHome()
+					if err != nil {
+						return outcome{}, err
+					}
+					if err := artifact.NewStore(root).SetPrefix(pos[0], pos[1]); err != nil {
+						return outcome{}, fmt.Errorf("set Namespace prefix: %w", err)
+					}
+				}
+				return outcome{command: "namespace set-prefix", state: mutationState(*dryRun), result: result}, nil
 			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			result, err := portable.Create(root, keys, output, replace, expect)
-			if err != nil {
-				return err
-			}
-			return emitResult(command.OutOrStdout(), "package create", "applied", map[string]any{
-				"digest": result.Digest,
-				"skills": len(result.Artifacts),
-				"output": output,
-			})
-		},
-	}
-	create.Flags().StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
-	create.Flags().StringVar(&output, "output", "", "absolute output archive path")
-	create.Flags().BoolVar(&replace, "replace", false, "replace an existing output guarded by --expect")
-	create.Flags().StringVar(&expect, "expect", "", "expected existing-output fingerprint")
-	packageCommand.AddCommand(create)
-	var expectedDigest string
-	inspect := &cobra.Command{
-		Use:   "inspect <archive>",
-		Short: "Verify a Package without writing.",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			result, err := portable.Inspect(arguments[0], expectedDigest)
-			if err != nil {
-				return asDomainError(err)
-			}
-			skills := make([]map[string]any, 0, len(result.Artifacts))
-			for _, revision := range result.Artifacts {
-				skills = append(skills, contentRef(revision.Selector, revision.Digest))
-			}
-			return emitResult(command.OutOrStdout(), "package inspect", "clean", map[string]any{
-				"digest": result.Digest,
-				"skills": skills,
-			})
-		},
-	}
-	inspect.Flags().StringVar(&expectedDigest, "expect-digest", "", "expected Package digest")
-	packageCommand.AddCommand(inspect)
-	var namespace string
-	var importDryRun bool
-	importCommand := &cobra.Command{
-		Use: "import <archive>", Short: "Verify and inertly import a Package.", Args: cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			importArtifact := portable.Import
-			if importDryRun {
-				importArtifact = portable.CheckImport
-			}
-			revisions, err := importArtifact(root, arguments[0], namespace)
-			if err != nil {
-				return asDomainError(err)
-			}
-			imported := make([]map[string]any, 0, len(revisions))
-			for _, revision := range revisions {
-				imported = append(imported, contentRef(revision.Selector, revision.Digest))
-			}
-			return emitResult(command.OutOrStdout(), "package import", mutationState(importDryRun), map[string]any{"imported": imported})
-		},
-	}
-	importCommand.Flags().StringVar(&namespace, "namespace", "", "isolated destination Namespace")
-	importCommand.Flags().BoolVar(&importDryRun, "dry-run", false, "preview import without writing")
-	packageCommand.AddCommand(importCommand)
-	return packageCommand
+		}),
+	})
 }
 
-func newNamespaceCommand() *cobra.Command {
-	namespaceCommand := &cobra.Command{Use: "namespace", Short: "Configure Namespace rendering rules."}
-	var dryRun bool
-	setPrefix := &cobra.Command{
-		Use:   "set-prefix <namespace> <prefix>",
-		Short: "Set a Recovery-backed target-facing Skill prefix.",
-		Args:  cobra.ExactArgs(2),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if err := artifact.ValidatePrefix(arguments[0], arguments[1]); err != nil {
-				return err
-			}
-			result := map[string]any{"namespace": arguments[0], "prefix": arguments[1]}
-			if !dryRun {
+func packageNode() *node {
+	return group("Create and inspect portable text-only Packages. In v1 a Package carries Skills only; name them with --skill namespace/name.", map[string]*node{
+		"create": command("Create a portable Package from selected Skills.", "--skill <namespace/name> --output <new-path>", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby package create")
+			var skillRefs []string
+			set.StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
+			output := set.String("output", "", "absolute output archive path")
+			replace := set.Bool("replace", false, "replace an existing output guarded by --expect")
+			expect := set.String("expect", "", "expected existing-output fingerprint")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if *output == "" {
+					return outcome{}, domainErrorf("package create requires --output <absolute-path>")
+				}
+				if len(skillRefs) == 0 {
+					return outcome{}, domainErrorf("package create requires at least one --skill <namespace/name>")
+				}
+				keys := make([]string, 0, len(skillRefs))
+				for _, ref := range skillRefs {
+					key, err := artifact.Key(artifact.KindSkill, ref)
+					if err != nil {
+						return outcome{}, asDomainError(err)
+					}
+					keys = append(keys, key)
+				}
 				root, err := brigsbyHome()
 				if err != nil {
-					return err
+					return outcome{}, err
 				}
-				if err := artifact.NewStore(root).SetPrefix(arguments[0], arguments[1]); err != nil {
-					return fmt.Errorf("set Namespace prefix: %w", err)
+				result, err := portable.Create(root, keys, *output, *replace, *expect)
+				if err != nil {
+					return outcome{}, err
 				}
+				return outcome{command: "package create", state: "applied", result: map[string]any{
+					"digest": result.Digest,
+					"skills": len(result.Artifacts),
+					"output": *output,
+				}}, nil
 			}
-			return emitResult(command.OutOrStdout(), "namespace set-prefix", mutationState(dryRun), result)
-		},
-	}
-	setPrefix.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
-	namespaceCommand.AddCommand(setPrefix)
-	return namespaceCommand
-}
-
-func newRecoveryCommand() *cobra.Command {
-	recoveryCommand := &cobra.Command{
-		Use:   "recovery",
-		Short: "Inspect and restore Recovery operations.",
-	}
-	var limit int
-	list := &cobra.Command{
-		Use:   "list",
-		Short: "List Recovery operation bundles.",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
+		}),
+		"inspect": command("Verify a Package without writing.", "<archive>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby package inspect")
+			expectedDigest := set.String("expect-digest", "", "expected Package digest")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				result, err := portable.Inspect(pos[0], *expectedDigest)
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				skills := make([]map[string]any, 0, len(result.Artifacts))
+				for _, revision := range result.Artifacts {
+					skills = append(skills, contentRef(revision.Selector, revision.Digest))
+				}
+				return outcome{command: "package inspect", state: "clean", result: map[string]any{
+					"digest": result.Digest,
+					"skills": skills,
+				}}, nil
 			}
-			records, err := recovery.New(root).List()
-			if err != nil {
-				return fmt.Errorf("list Recovery operations: %w", err)
+		}),
+		"import": command("Verify and inertly import a Package.", "<archive>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby package import")
+			namespace := set.String("namespace", "", "isolated destination Namespace")
+			importDryRun := set.Bool("dry-run", false, "preview import without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				importArtifact := portable.Import
+				if *importDryRun {
+					importArtifact = portable.CheckImport
+				}
+				revisions, err := importArtifact(root, pos[0], *namespace)
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				imported := make([]map[string]any, 0, len(revisions))
+				for _, revision := range revisions {
+					imported = append(imported, contentRef(revision.Selector, revision.Digest))
+				}
+				return outcome{command: "package import", state: mutationState(*importDryRun), result: map[string]any{"imported": imported}}, nil
 			}
-			if limit > 0 && len(records) > limit {
-				records = records[:limit]
-			}
-			operations := make([]map[string]any, 0, len(records))
-			for _, record := range records {
-				operations = append(operations, map[string]any{
-					"id":     record.ID,
-					"state":  record.State,
-					"target": record.Target,
-				})
-			}
-			return emitResult(command.OutOrStdout(), "recovery list", "clean", map[string]any{"operations": operations})
-		},
-	}
-	list.Flags().IntVar(&limit, "limit", 0, "maximum operations to list")
-	recoveryCommand.AddCommand(list)
-	recoveryCommand.AddCommand(&cobra.Command{
-		Use:   "show <recovery-id>",
-		Short: "Inspect one Recovery operation bundle.",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			record, err := recovery.New(root).Show(arguments[0])
-			if err != nil {
-				return fmt.Errorf("show Recovery operation: %w", err)
-			}
-			return emitResult(command.OutOrStdout(), "recovery show", "clean", map[string]any{
-				"operation": map[string]any{
-					"id":                      record.ID,
-					"state":                   record.State,
-					"target":                  record.Target,
-					"target_fingerprint":      record.TargetFingerprint,
-					"replacement_fingerprint": record.ReplacementFingerprint,
-				},
-			})
-		},
+		}),
 	})
-	var restoreExpect string
-	var restoreDryRun bool
-	restore := &cobra.Command{
-		Use:   "restore <recovery-id>",
-		Short: "Restore one Recovery operation's preimage.",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			if lifecycle.New(root).Exists(arguments[0]) {
-				if restoreDryRun {
-					return emitResult(command.OutOrStdout(), "recovery restore", "planned", map[string]any{"restored": map[string]any{"recovery_id": arguments[0]}})
-				}
-				if err := lifecycle.New(root).Restore(arguments[0]); err != nil {
-					return fmt.Errorf("restore lifecycle batch: %w", err)
-				}
-				return emitResult(command.OutOrStdout(), "recovery restore", "applied", map[string]any{"restored": map[string]any{"recovery_id": arguments[0]}})
-			}
-			service := recovery.New(root)
-			record, err := service.Show(arguments[0])
-			if err != nil {
-				return fmt.Errorf("show Recovery operation: %w", err)
-			}
-			current, err := recovery.Fingerprint(record.Target)
-			if err != nil {
-				return fmt.Errorf("fingerprint restore target: %w", err)
-			}
-			if restoreExpect != "" && restoreExpect != current {
-				return fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", current)
-			}
-			restored := map[string]any{"recovery_id": arguments[0], "target": record.Target}
-			if restoreDryRun {
-				return emitResult(command.OutOrStdout(), "recovery restore", "planned", map[string]any{"restored": restored})
-			}
-			operation, err := service.Restore(arguments[0])
-			if err != nil {
-				return fmt.Errorf("restore Recovery operation: %w", err)
-			}
-			if err := harness.NewRegistry(root).ForgetProjection(record.Target); err != nil {
-				return fmt.Errorf("forget Projection: %w", err)
-			}
-			restored["operation_id"] = operation.ID
-			return emitResult(command.OutOrStdout(), "recovery restore", "applied", map[string]any{"restored": restored})
-		},
-	}
-	restore.Flags().StringVar(&restoreExpect, "expect", "", "expected current target fingerprint")
-	restore.Flags().BoolVar(&restoreDryRun, "dry-run", false, "preview without writing")
-	recoveryCommand.AddCommand(restore)
-	return recoveryCommand
 }
 
-// newContentCommand builds the `skill` or `instruction` command group. word is
-// the Caller-facing singular ("skill"/"instruction"); kind is the internal
-// artifact kind. The two groups carry the same verbs; only `add`'s arity and a
-// few help strings differ.
-func newContentCommand(word, kind string) *cobra.Command {
+func recoveryNode() *node {
+	return group("Inspect and restore Recovery operations.", map[string]*node{
+		"list": command("List Recovery operation bundles.", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby recovery list")
+			limit := set.Int("limit", 0, "maximum operations to list")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				records, err := recovery.New(root).List()
+				if err != nil {
+					return outcome{}, fmt.Errorf("list Recovery operations: %w", err)
+				}
+				if *limit > 0 && len(records) > *limit {
+					records = records[:*limit]
+				}
+				operations := make([]map[string]any, 0, len(records))
+				for _, record := range records {
+					operations = append(operations, map[string]any{
+						"id":     record.ID,
+						"state":  record.State,
+						"target": record.Target,
+					})
+				}
+				return outcome{command: "recovery list", state: "clean", result: map[string]any{"operations": operations}}, nil
+			}
+		}),
+		"show": command("Inspect one Recovery operation bundle.", "<recovery-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby recovery show")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				record, err := recovery.New(root).Show(pos[0])
+				if err != nil {
+					return outcome{}, fmt.Errorf("show Recovery operation: %w", err)
+				}
+				return outcome{command: "recovery show", state: "clean", result: map[string]any{
+					"operation": map[string]any{
+						"id":                      record.ID,
+						"state":                   record.State,
+						"target":                  record.Target,
+						"target_fingerprint":      record.TargetFingerprint,
+						"replacement_fingerprint": record.ReplacementFingerprint,
+					},
+				}}, nil
+			}
+		}),
+		"restore": command("Restore one Recovery operation's preimage.", "<recovery-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby recovery restore")
+			restoreExpect := set.String("expect", "", "expected current target fingerprint")
+			restoreDryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				if lifecycle.New(root).Exists(pos[0]) {
+					if *restoreDryRun {
+						return outcome{state: "planned", result: map[string]any{"restored": map[string]any{"recovery_id": pos[0]}}}, nil
+					}
+					if err := lifecycle.New(root).Restore(pos[0]); err != nil {
+						return outcome{}, fmt.Errorf("restore lifecycle batch: %w", err)
+					}
+					return outcome{state: "applied", result: map[string]any{"restored": map[string]any{"recovery_id": pos[0]}}}, nil
+				}
+				service := recovery.New(root)
+				record, err := service.Show(pos[0])
+				if err != nil {
+					return outcome{}, fmt.Errorf("show Recovery operation: %w", err)
+				}
+				current, err := recovery.Fingerprint(record.Target)
+				if err != nil {
+					return outcome{}, fmt.Errorf("fingerprint restore target: %w", err)
+				}
+				if *restoreExpect != "" && *restoreExpect != current {
+					return outcome{}, fmt.Errorf("BLOCKED: target fingerprint changed or --expect is missing; expected %s", current)
+				}
+				restored := map[string]any{"recovery_id": pos[0], "target": record.Target}
+				if *restoreDryRun {
+					return outcome{command: "recovery restore", state: "planned", result: map[string]any{"restored": restored}}, nil
+				}
+				operation, err := service.Restore(pos[0])
+				if err != nil {
+					return outcome{}, fmt.Errorf("restore Recovery operation: %w", err)
+				}
+				if err := harness.NewRegistry(root).ForgetProjection(record.Target); err != nil {
+					return outcome{}, fmt.Errorf("forget Projection: %w", err)
+				}
+				restored["operation_id"] = operation.ID
+				return outcome{command: "recovery restore", state: "applied", result: map[string]any{"restored": restored}}, nil
+			}
+		}),
+	})
+}
+
+// contentNode builds the `skill` or `instruction` command group. word is the
+// Caller-facing singular ("skill"/"instruction"); kind is the internal artifact
+// kind. The two groups carry the same verbs; only `add`'s arity and a few help
+// strings differ.
+func contentNode(word, kind string) *node {
 	plural := word + "s"
 	titlePlural := strings.ToUpper(word[:1]) + word[1:] + "s"
-	group := &cobra.Command{
-		Use:   word,
-		Short: fmt.Sprintf("Capture and inspect canonical %s.", titlePlural),
-		Long:  fmt.Sprintf("Capture and inspect canonical %s. A reference is namespace/name, for example main/release-notes; the default namespace is main.", titlePlural),
-	}
 
-	var namespace, name string
-	addArgs := cobra.MinimumNArgs(1)
-	addUse := "add <path>..."
+	addMin, addMax, addHint := 1, -1, "<path>..."
 	if kind == artifact.KindInstruction {
-		addArgs = cobra.ExactArgs(1)
-		addUse = "add <path>"
+		addMin, addMax, addHint = 1, 1, "<path>"
 	}
-	add := &cobra.Command{
-		Use:   addUse,
-		Short: fmt.Sprintf("Capture one or more local %s as immutable canonical revisions.", titlePlural),
-		Long:  contentAddLong(word),
-		Args:  addArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if command.Flags().Changed("name") && len(arguments) != 1 {
-				return domainErrorf("--name cannot rename %d sources at once; add them one path at a time", len(arguments))
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			store := artifact.NewStore(root)
-			options := artifact.CaptureOptions{Namespace: namespace, Name: name, ExplicitName: command.Flags().Changed("name")}
 
-			if kind == artifact.KindInstruction {
-				revision, err := store.CaptureInstructions(arguments[0], options)
+	return group(fmt.Sprintf("Capture and inspect canonical %s. A reference is namespace/name, for example main/release-notes; the default namespace is main.", titlePlural), map[string]*node{
+		"try":   tryNode(word, kind),
+		"temps": tempsNode(word, kind),
+		"add": command(fmt.Sprintf("Capture one or more local %s as immutable canonical revisions.", titlePlural), addHint, addMin, addMax, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " add")
+			var namespace, name string
+			set.StringVar(&namespace, "namespace", "main", "destination Namespace")
+			set.StringVar(&name, "name", "", fmt.Sprintf("canonical %s name (single source only)", word))
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if set.Changed("name") && len(pos) != 1 {
+					return outcome{}, domainErrorf("--name cannot rename %d sources at once; add them one path at a time", len(pos))
+				}
+				root, err := brigsbyHome()
 				if err != nil {
-					return domainErrorf("capture %s %s: %w", word, arguments[0], err)
+					return outcome{}, err
 				}
-				return emitResult(command.OutOrStdout(), word+" add", "applied", map[string]any{
-					"revisions": []map[string]any{contentRef(revision.Selector, revision.Digest)},
-				})
-			}
+				store := artifact.NewStore(root)
+				options := artifact.CaptureOptions{Namespace: namespace, Name: name, ExplicitName: set.Changed("name")}
 
-			sources, err := expandSkillSources(arguments)
-			if err != nil {
-				return asDomainError(err)
-			}
-			if len(sources) > 1 && command.Flags().Changed("name") {
-				return domainErrorf("--name cannot rename %d Skills at once; add them one path at a time", len(sources))
-			}
-			captured := make([]artifact.Revision, 0, len(sources))
-			for _, source := range sources {
-				revision, err := store.CaptureSkill(source, options)
-				if err != nil {
-					if len(captured) > 0 {
-						return domainErrorf("capture %s %s (after capturing %s): %w", word, source, capturedRefs(captured), err)
-					}
-					return domainErrorf("capture %s %s: %w", word, source, err)
-				}
-				captured = append(captured, revision)
-			}
-			noteUntrackedSources(command, root, captured, sources)
-			revisions := make([]map[string]any, 0, len(captured))
-			for _, revision := range captured {
-				revisions = append(revisions, contentRef(revision.Selector, revision.Digest))
-			}
-			return emitResult(command.OutOrStdout(), word+" add", "applied", map[string]any{"revisions": revisions})
-		},
-	}
-	add.Flags().StringVar(&namespace, "namespace", "main", "destination Namespace")
-	add.Flags().StringVar(&name, "name", "", fmt.Sprintf("canonical %s name (single source only)", word))
-	group.AddCommand(add)
-
-	var listNamespace string
-	list := &cobra.Command{
-		Use:   "list",
-		Short: fmt.Sprintf("List canonical %s and their selected Revisions.", titlePlural),
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			revisions, err := artifact.NewStore(root).List(artifact.ListOptions{Namespace: listNamespace, Kind: kind})
-			if err != nil {
-				return fmt.Errorf("list %s: %w", plural, err)
-			}
-			entries := make([]map[string]any, 0, len(revisions))
-			for _, revision := range revisions {
-				entries = append(entries, contentRef(revision.Selector, revision.Digest))
-			}
-			return emitResult(command.OutOrStdout(), word+" list", "clean", map[string]any{plural: entries})
-		},
-	}
-	list.Flags().StringVar(&listNamespace, "namespace", "", "filter by Namespace")
-	group.AddCommand(list)
-
-	var selectRevision string
-	var selectDryRun bool
-	selectCommand := &cobra.Command{
-		Use:   "select <namespace/name>",
-		Short: fmt.Sprintf("Select an already stored %s Revision.", word),
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if selectRevision == "" {
-				return domainErrorf("select requires --revision sha256-<hex>")
-			}
-			key, err := artifact.Key(kind, arguments[0])
-			if err != nil {
-				return asDomainError(err)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			store := artifact.NewStore(root)
-			resolve := store.Select
-			if selectDryRun {
-				resolve = store.VerifyRevision
-			}
-			revision, err := resolve(key, selectRevision)
-			if err != nil {
-				return fmt.Errorf("select %s: %w", word, err)
-			}
-			return emitResult(command.OutOrStdout(), word+" select", mutationState(selectDryRun), map[string]any{
-				"selected": contentRef(revision.Selector, revision.Digest),
-			})
-		},
-	}
-	selectCommand.Flags().StringVar(&selectRevision, "revision", "", "stored Revision digest")
-	selectCommand.Flags().BoolVar(&selectDryRun, "dry-run", false, "preview without writing")
-	group.AddCommand(selectCommand)
-
-	var promoteRevision string
-	var promoteDryRun bool
-	promote := &cobra.Command{
-		Use:   "promote <namespace/name>",
-		Short: fmt.Sprintf("Promote one imported %s Revision to main.", word),
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			key, err := artifact.Key(kind, arguments[0])
-			if err != nil {
-				return asDomainError(err)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			store := artifact.NewStore(root)
-			revisionDigest := promoteRevision
-			if revisionDigest == "" {
-				revisionDigest, err = soleRevision(store, key)
-				if err != nil {
-					return err
-				}
-			}
-			resolve := store.Promote
-			if promoteDryRun {
-				resolve = store.VerifyRevision
-			}
-			revision, err := resolve(key, revisionDigest)
-			if err != nil {
-				return fmt.Errorf("promote %s: %w", word, err)
-			}
-			return emitResult(command.OutOrStdout(), word+" promote", mutationState(promoteDryRun), map[string]any{
-				"promoted": map[string]any{
-					"kind":   word,
-					"ref":    "main/" + refName(arguments[0]),
-					"digest": revision.Digest,
-					"origin": map[string]any{"ref": artifact.DisplayRef(key), "revision": revision.Digest},
-				},
-			})
-		},
-	}
-	promote.Flags().StringVar(&promoteRevision, "revision", "", "imported Revision digest")
-	promote.Flags().BoolVar(&promoteDryRun, "dry-run", false, "preview without writing")
-	group.AddCommand(promote)
-
-	var demoteDeleteProjections, demotePurge, demoteDryRun bool
-	demote := &cobra.Command{
-		Use:   "demote <main/name>",
-		Short: fmt.Sprintf("Move one active %s to archive.", word),
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			key, err := artifact.Key(kind, arguments[0])
-			if err != nil {
-				return asDomainError(err)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			if !strings.HasPrefix(key, "main/") {
-				return domainErrorf("demote requires main/%s", refName(arguments[0]))
-			}
-			store, registry := artifact.NewStore(root), harness.NewRegistry(root)
-			if _, err := store.Selected(key); err != nil {
-				return err
-			}
-			projections, err := registry.ListProjections()
-			if err != nil {
-				return err
-			}
-			var owned []harness.Projection
-			for _, projection := range projections {
-				if projection.Artifact == key {
-					owned = append(owned, projection)
-				}
-			}
-			if demoteDeleteProjections && !demotePurge {
-				for _, projection := range owned {
-					matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+				if kind == artifact.KindInstruction {
+					revision, err := store.CaptureInstructions(pos[0], options)
 					if err != nil {
+						return outcome{}, domainErrorf("capture %s %s: %w", word, pos[0], err)
+					}
+					return outcome{command: word + " add", state: "applied", result: map[string]any{
+						"revisions": []map[string]any{contentRef(revision.Selector, revision.Digest)},
+					}}, nil
+				}
+
+				sources, err := expandSkillSources(pos)
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				if len(sources) > 1 && set.Changed("name") {
+					return outcome{}, domainErrorf("--name cannot rename %d Skills at once; add them one path at a time", len(sources))
+				}
+				captured := make([]artifact.Revision, 0, len(sources))
+				for _, source := range sources {
+					revision, err := store.CaptureSkill(source, options)
+					if err != nil {
+						if len(captured) > 0 {
+							return outcome{}, domainErrorf("capture %s %s (after capturing %s): %w", word, source, capturedRefs(captured), err)
+						}
+						return outcome{}, domainErrorf("capture %s %s: %w", word, source, err)
+					}
+					captured = append(captured, revision)
+				}
+				noteUntrackedSources(stderr, root, captured, sources)
+				revisions := make([]map[string]any, 0, len(captured))
+				for _, revision := range captured {
+					revisions = append(revisions, contentRef(revision.Selector, revision.Digest))
+				}
+				return outcome{command: word + " add", state: "applied", result: map[string]any{"revisions": revisions}}, nil
+			}
+		}),
+		"list": command(fmt.Sprintf("List canonical %s and their selected Revisions.", titlePlural), "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " list")
+			listNamespace := set.String("namespace", "", "filter by Namespace")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				revisions, err := artifact.NewStore(root).List(artifact.ListOptions{Namespace: *listNamespace, Kind: kind})
+				if err != nil {
+					return outcome{}, fmt.Errorf("list %s: %w", plural, err)
+				}
+				entries := make([]map[string]any, 0, len(revisions))
+				for _, revision := range revisions {
+					entries = append(entries, contentRef(revision.Selector, revision.Digest))
+				}
+				return outcome{command: word + " list", state: "clean", result: map[string]any{plural: entries}}, nil
+			}
+		}),
+		"select": command(fmt.Sprintf("Select an already stored %s Revision.", word), "<namespace/name>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " select")
+			selectRevision := set.String("revision", "", "stored Revision digest")
+			selectDryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if *selectRevision == "" {
+					return outcome{}, domainErrorf("select requires --revision sha256-<hex>")
+				}
+				key, err := artifact.Key(kind, pos[0])
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				store := artifact.NewStore(root)
+				resolve := store.Select
+				if *selectDryRun {
+					resolve = store.VerifyRevision
+				}
+				revision, err := resolve(key, *selectRevision)
+				if err != nil {
+					return outcome{}, fmt.Errorf("select %s: %w", word, err)
+				}
+				return outcome{command: word + " select", state: mutationState(*selectDryRun), result: map[string]any{
+					"selected": contentRef(revision.Selector, revision.Digest),
+				}}, nil
+			}
+		}),
+		"promote": command(fmt.Sprintf("Promote one imported %s Revision to main.", word), "<namespace/name>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " promote")
+			promoteRevision := set.String("revision", "", "imported Revision digest")
+			promoteDryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				key, err := artifact.Key(kind, pos[0])
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				store := artifact.NewStore(root)
+				revisionDigest := *promoteRevision
+				if revisionDigest == "" {
+					revisionDigest, err = soleRevision(store, key)
+					if err != nil {
+						return outcome{}, err
+					}
+				}
+				resolve := store.Promote
+				if *promoteDryRun {
+					resolve = store.VerifyRevision
+				}
+				revision, err := resolve(key, revisionDigest)
+				if err != nil {
+					return outcome{}, fmt.Errorf("promote %s: %w", word, err)
+				}
+				return outcome{command: word + " promote", state: mutationState(*promoteDryRun), result: map[string]any{
+					"promoted": map[string]any{
+						"kind":   word,
+						"ref":    "main/" + refName(pos[0]),
+						"digest": revision.Digest,
+						"origin": map[string]any{"ref": artifact.DisplayRef(key), "revision": revision.Digest},
+					},
+				}}, nil
+			}
+		}),
+		"delete": command(fmt.Sprintf("Delete one %s and its managed projections.", word), "<namespace/name>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " delete")
+			purge := set.Bool("purge", false, "delete without Recovery")
+			dryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				key, err := artifact.Key(kind, pos[0])
+				if err != nil {
+					return outcome{}, asDomainError(err)
+				}
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				store, registry := artifact.NewStore(root), harness.NewRegistry(root)
+				if _, err := store.Selected(key); err != nil {
+					return outcome{}, err
+				}
+				canonicalPath, err := store.ArtifactPath(key)
+				if err != nil {
+					return outcome{}, err
+				}
+				projections, err := registry.ListProjections()
+				if err != nil {
+					return outcome{}, err
+				}
+				owned := []harness.Projection{}
+				for _, projection := range projections {
+					if projection.Artifact == key {
+						owned = append(owned, projection)
+						if !*purge {
+							matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+							if err != nil {
+								return outcome{}, err
+							}
+							if !matches && !mustBeMissing(projection.Path) {
+								return outcome{}, domainErrorf("BLOCKED: Drift %s; rerun with --purge to delete it permanently", projection.Path)
+							}
+						}
+					}
+				}
+				targets := append([]string{canonicalPath, filepath.Join(root, "projections.toml")}, projectionPaths(owned)...)
+				if *dryRun {
+					return outcome{state: "planned", result: map[string]any{"deleted": pos[0], "projections": len(owned), "purge": *purge, "recovery": !*purge, "targets": targets}}, nil
+				}
+				apply := func() error {
+					if err := os.RemoveAll(canonicalPath); err != nil {
 						return err
 					}
-					if !matches && !mustBeMissing(projection.Path) {
-						return domainErrorf("BLOCKED: Drift %s; rerun with --purge to delete it permanently", projection.Path)
-					}
-				}
-			}
-			archiveKey := "archive/" + kind + "/" + refName(arguments[0])
-			archivePath, err := store.ArtifactPath(archiveKey)
-			if err != nil {
-				return err
-			}
-			if _, err := os.Stat(archivePath); err == nil {
-				return domainErrorf("archive %s already exists", "archive/"+refName(arguments[0]))
-			} else if !os.IsNotExist(err) {
-				return err
-			}
-			if demotePurge && !demoteDeleteProjections {
-				return domainErrorf("--purge requires --delete-projections")
-			}
-			if demoteDryRun {
-				targets := []string{mustArtifactPath(store, key), archivePath, filepath.Join(root, "projections.toml")}
-				if demoteDeleteProjections {
-					targets = append(targets, projectionPaths(owned)...)
-				}
-				return emitResult(command.OutOrStdout(), word+" demote", "planned", map[string]any{"delete_projections": demoteDeleteProjections, "from": arguments[0], "projections": len(owned), "purge": demotePurge, "recovery": demoteDeleteProjections && !demotePurge, "targets": targets, "to": "archive/" + refName(arguments[0])})
-			}
-			var batch lifecycle.Batch
-			apply := func() error {
-				if _, err := store.Demote(key); err != nil {
-					return err
-				}
-				if demoteDeleteProjections {
 					for _, projection := range owned {
 						if err := os.RemoveAll(projection.Path); err != nil {
 							return err
 						}
 					}
-				}
-				_, err := registry.ForgetArtifact(key)
-				return err
-			}
-			if demoteDeleteProjections && !demotePurge {
-				targets := append([]lifecycle.Target{{Path: mustArtifactPath(store, key)}, {Path: archivePath}, {Path: filepath.Join(root, "projections.toml")}}, lifecycleTargets(owned)...)
-				var err error
-				batch, err = lifecycle.New(root).Apply(targets, apply)
-				if err != nil {
-					return lifecyclePartialError(batch, err)
-				}
-			} else if err := apply(); err != nil {
-				return err
-			}
-			result := map[string]any{"from": arguments[0], "to": "archive/" + refName(arguments[0]), "projections": len(owned), "delete_projections": demoteDeleteProjections, "purge": demotePurge}
-			if batch.ID != "" {
-				result["recovery_id"] = batch.ID
-			}
-			return emitResult(command.OutOrStdout(), word+" demote", "applied", result)
-		},
-	}
-	demote.Flags().BoolVar(&demoteDeleteProjections, "delete-projections", false, "delete linked Harness copies")
-	demote.Flags().BoolVar(&demotePurge, "purge", false, "delete linked Harness copies without Recovery")
-	demote.Flags().BoolVar(&demoteDryRun, "dry-run", false, "preview without writing")
-	group.AddCommand(demote)
-
-	var deletePurge, deleteDryRun bool
-	deleteCommand := &cobra.Command{
-		Use: "delete <namespace/name>", Short: fmt.Sprintf("Delete one %s and its managed projections.", word), Args: cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			key, err := artifact.Key(kind, arguments[0])
-			if err != nil {
-				return asDomainError(err)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			store, registry := artifact.NewStore(root), harness.NewRegistry(root)
-			if _, err := store.Selected(key); err != nil {
-				return err
-			}
-			path, err := store.ArtifactPath(key)
-			if err != nil {
-				return err
-			}
-			projections, err := registry.ListProjections()
-			if err != nil {
-				return err
-			}
-			owned := []harness.Projection{}
-			for _, projection := range projections {
-				if projection.Artifact == key {
-					owned = append(owned, projection)
-					if !deletePurge {
-						matches, err := projectionFingerprintMatches(projection.Path, projection.Fingerprint)
-						if err != nil {
-							return err
-						}
-						if !matches && !mustBeMissing(projection.Path) {
-							return domainErrorf("BLOCKED: Drift %s; rerun with --purge to delete it permanently", projection.Path)
-						}
-					}
-				}
-			}
-			if deleteDryRun {
-				targets := append([]string{path, filepath.Join(root, "projections.toml")}, projectionPaths(owned)...)
-				return emitResult(command.OutOrStdout(), word+" delete", "planned", map[string]any{"deleted": arguments[0], "projections": len(owned), "purge": deletePurge, "recovery": !deletePurge, "targets": targets})
-			}
-			apply := func() error {
-				if err := os.RemoveAll(path); err != nil {
+					_, err := registry.ForgetArtifact(key)
 					return err
 				}
-				for _, projection := range owned {
-					if err := os.RemoveAll(projection.Path); err != nil {
-						return err
+				result := map[string]any{"deleted": pos[0], "projections": len(owned), "purge": *purge}
+				if *purge {
+					if err := apply(); err != nil {
+						return outcome{}, err
 					}
+				} else {
+					batch, err := lifecycle.New(root).Apply(append([]lifecycle.Target{{Path: canonicalPath}, {Path: filepath.Join(root, "projections.toml")}}, lifecycleTargets(owned)...), apply)
+					if err != nil {
+						return outcome{}, lifecyclePartialError(batch, err)
+					}
+					result["recovery_id"] = batch.ID
 				}
-				_, err := registry.ForgetArtifact(key)
-				return err
+				return outcome{state: "applied", result: result}, nil
 			}
-			var batch lifecycle.Batch
-			if deletePurge {
-				if err := apply(); err != nil {
-					return err
-				}
-			} else {
-				targets := append([]lifecycle.Target{{Path: path}, {Path: filepath.Join(root, "projections.toml")}}, lifecycleTargets(owned)...)
-				batch, err = lifecycle.New(root).Apply(targets, apply)
+		}),
+		"show": command(fmt.Sprintf("Show metadata for the selected canonical %s revision. Pass --files to print the selected canonical text files.", word), "<namespace/name>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby " + word + " show")
+			showFiles := set.Bool("files", false, "print selected canonical text files")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				key, err := artifact.Key(kind, pos[0])
 				if err != nil {
-					return lifecyclePartialError(batch, err)
+					return outcome{}, asDomainError(err)
 				}
-			}
-			result := map[string]any{"deleted": arguments[0], "projections": len(owned), "purge": deletePurge}
-			if batch.ID != "" {
-				result["recovery_id"] = batch.ID
-			}
-			return emitResult(command.OutOrStdout(), word+" delete", "applied", result)
-		},
-	}
-	deleteCommand.Flags().BoolVar(&deletePurge, "purge", false, "delete without Recovery")
-	deleteCommand.Flags().BoolVar(&deleteDryRun, "dry-run", false, "preview without writing")
-	group.AddCommand(deleteCommand)
-
-	var showFiles bool
-	show := &cobra.Command{
-		Use:   "show <namespace/name>",
-		Short: fmt.Sprintf("Show metadata for the selected canonical %s revision.", word),
-		Long:  fmt.Sprintf("Show metadata for the selected canonical %s revision. Pass --files to print the selected canonical text files.", word),
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			key, err := artifact.Key(kind, arguments[0])
-			if err != nil {
-				return asDomainError(err)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			store := artifact.NewStore(root)
-			revision, err := store.Selected(key)
-			if err != nil {
-				return fmt.Errorf("show %s: %w", word, err)
-			}
-			origin, err := store.Origin(key)
-			if err != nil {
-				return fmt.Errorf("show %s origin: %w", word, err)
-			}
-			revisionResult := contentRef(revision.Selector, revision.Digest)
-			if origin.Selector != "" {
-				revisionResult["origin"] = map[string]any{"ref": artifact.DisplayRef(origin.Selector), "revision": origin.Revision}
-			}
-			result := map[string]any{"revision": revisionResult}
-			if showFiles {
-				_, filesPath, err := store.SelectedContentFilesPath(key)
+				root, err := brigsbyHome()
 				if err != nil {
-					return fmt.Errorf("show %s files: %w", word, err)
+					return outcome{}, err
 				}
-				files, err := artifactFiles(filesPath)
+				store := artifact.NewStore(root)
+				revision, err := store.Selected(key)
 				if err != nil {
-					return fmt.Errorf("read %s files: %w", word, err)
+					return outcome{}, fmt.Errorf("show %s: %w", word, err)
 				}
-				result["files"] = files
+				origin, err := store.Origin(key)
+				if err != nil {
+					return outcome{}, fmt.Errorf("show %s origin: %w", word, err)
+				}
+				revisionResult := contentRef(revision.Selector, revision.Digest)
+				if origin.Selector != "" {
+					revisionResult["origin"] = map[string]any{"ref": artifact.DisplayRef(origin.Selector), "revision": origin.Revision}
+				}
+				result := map[string]any{"revision": revisionResult}
+				if *showFiles {
+					_, filesPath, err := store.SelectedContentFilesPath(key)
+					if err != nil {
+						return outcome{}, fmt.Errorf("show %s files: %w", word, err)
+					}
+					files, err := artifactFiles(filesPath)
+					if err != nil {
+						return outcome{}, fmt.Errorf("read %s files: %w", word, err)
+					}
+					result["files"] = files
+				}
+				return outcome{command: word + " show", state: "clean", result: result}, nil
 			}
-			return emitResult(command.OutOrStdout(), word+" show", "clean", result)
-		},
-	}
-	show.Flags().BoolVar(&showFiles, "files", false, "print selected canonical text files")
-	group.AddCommand(show)
-	return group
+		}),
+	})
 }
 
 // artifactFiles reads the selected Revision's runtime tree into sorted
@@ -1272,365 +1629,329 @@ func artifactFiles(root string) ([]map[string]any, error) {
 	return files, err
 }
 
-func newHarnessCommand() *cobra.Command {
-	harnessCommand := &cobra.Command{
-		Use:   "harness",
-		Short: "Discover, link, and inspect Harnesses.",
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if len(arguments) > 0 {
-				return fmt.Errorf("unknown command %q for %q", arguments[0], command.CommandPath())
-			}
-			return command.Help()
-		},
-	}
-	var harnessName string
-	discover := &cobra.Command{
-		Use:   "discover",
-		Short: "Discover supported user-level Harness installations.",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverBuiltinCandidates()
-			if err != nil {
-				return err
-			}
-			matched := false
-			found := []map[string]any{}
-			for _, candidate := range candidates {
-				if harnessName != "" && candidate.candidate.Name != harnessName {
-					continue
+func harnessNode() *node {
+	return group("Discover, link, inspect, and synchronize Harnesses.", map[string]*node{
+		"discover": command("Discover supported user-level Harness installations.", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby harness discover")
+			harnessName := set.String("harness", "", "filter by supported Harness")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				candidates, err := discoverBuiltinCandidates()
+				if err != nil {
+					return outcome{}, err
 				}
-				matched = true
+				matched := false
+				found := []map[string]any{}
+				for _, candidate := range candidates {
+					if *harnessName != "" && candidate.candidate.Name != *harnessName {
+						continue
+					}
+					matched = true
+					if !candidate.found {
+						continue
+					}
+					found = append(found, map[string]any{
+						"id":          candidate.candidate.ID,
+						"harness":     candidate.candidate.Name,
+						"skills_path": candidate.candidate.SkillsPath,
+					})
+				}
+				if *harnessName != "" && !matched {
+					return outcome{}, fmt.Errorf("unsupported harness %q", *harnessName)
+				}
+				return outcome{command: "harness discover", state: "clean", result: map[string]any{"candidates": found}}, nil
+			}
+		}),
+		"link": command("Link a discovered Harness installation.", "<candidate-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby harness link")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				candidates, err := discoverBuiltinCandidates()
+				if err != nil {
+					return outcome{}, err
+				}
+				var candidate discoveredCandidate
+				foundCandidate := false
+				for _, item := range candidates {
+					if item.candidate.ID == pos[0] {
+						candidate = item
+						foundCandidate = true
+						break
+					}
+				}
+				if !foundCandidate {
+					return outcome{}, fmt.Errorf("unknown Harness candidate %q; run 'brigsby harness discover'", pos[0])
+				}
 				if !candidate.found {
-					continue
+					return outcome{}, fmt.Errorf("%s candidate %q is not currently installed at %s", candidate.candidate.Name, candidate.candidate.ID, candidate.candidate.SkillsPath)
 				}
-				found = append(found, map[string]any{
-					"id":          candidate.candidate.ID,
-					"harness":     candidate.candidate.Name,
-					"skills_path": candidate.candidate.SkillsPath,
-				})
-			}
-			if harnessName != "" && !matched {
-				return fmt.Errorf("unsupported harness %q", harnessName)
-			}
-			return emitResult(command.OutOrStdout(), "harness discover", "clean", map[string]any{"candidates": found})
-		},
-	}
-	discover.Flags().StringVar(&harnessName, "harness", "", "filter by supported Harness")
-	harnessCommand.AddCommand(discover)
-	harnessCommand.AddCommand(&cobra.Command{
-		Use:   "link <candidate-id>",
-		Short: "Link a discovered Harness installation.",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			candidates, err := discoverBuiltinCandidates()
-			if err != nil {
-				return err
-			}
-			var candidate discoveredCandidate
-			foundCandidate := false
-			for _, item := range candidates {
-				if item.candidate.ID == arguments[0] {
-					candidate = item
-					foundCandidate = true
-					break
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
 				}
-			}
-			if !foundCandidate {
-				return fmt.Errorf("unknown Harness candidate %q; run 'brigsby harness discover'", arguments[0])
-			}
-			if !candidate.found {
-				return fmt.Errorf("%s candidate %q is not currently installed at %s", candidate.candidate.Name, candidate.candidate.ID, candidate.candidate.SkillsPath)
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			if err := harness.NewRegistry(root).Link(candidate.candidate); err != nil {
-				return fmt.Errorf("link Harness: %w", err)
-			}
-			return emitResult(command.OutOrStdout(), "harness link", "applied", map[string]any{
-				"linked": map[string]any{
-					"id":          candidate.candidate.ID,
-					"skills_path": candidate.candidate.SkillsPath,
-				},
-			})
-		},
-	})
-	var unlinkDryRun bool
-	unlink := &cobra.Command{
-		Use:   "unlink <linked-installation-id>",
-		Short: "Remove a linked Harness association without deleting its files.",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			registry := harness.NewRegistry(root)
-			linked, err := registry.List()
-			if err != nil {
-				return fmt.Errorf("read linked Harnesses: %w", err)
-			}
-			found := false
-			for _, candidate := range linked {
-				if candidate.ID == arguments[0] {
-					found = true
-					break
+				if err := harness.NewRegistry(root).Link(candidate.candidate); err != nil {
+					return outcome{}, fmt.Errorf("link Harness: %w", err)
 				}
+				return outcome{command: "harness link", state: "applied", result: map[string]any{
+					"linked": map[string]any{
+						"id":          candidate.candidate.ID,
+						"skills_path": candidate.candidate.SkillsPath,
+					},
+				}}, nil
 			}
-			if !found {
-				return fmt.Errorf("linked Harness %q was not found", arguments[0])
-			}
-			if !unlinkDryRun {
-				if err := registry.Unlink(arguments[0]); err != nil {
-					return fmt.Errorf("unlink Harness: %w", err)
+		}),
+		"unlink": command("Remove a linked Harness association without deleting its files.", "<linked-installation-id>", 1, 1, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby harness unlink")
+			unlinkDryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
 				}
-			}
-			return emitResult(command.OutOrStdout(), "harness unlink", mutationState(unlinkDryRun), map[string]any{"unlinked": arguments[0]})
-		},
-	}
-	unlink.Flags().BoolVar(&unlinkDryRun, "dry-run", false, "preview without writing")
-	harnessCommand.AddCommand(unlink)
-	var statusHarness string
-	var statusManaged, statusUnowned, statusAll bool
-	status := &cobra.Command{
-		Use:   "status",
-		Short: "Show managed Harness Projections and Drift.",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			if statusUnowned && (statusManaged || statusAll) {
-				return domainErrorf("--unowned cannot be combined with --managed or --all")
-			}
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			registry := harness.NewRegistry(root)
-			linked, err := registry.List()
-			if err != nil {
-				return fmt.Errorf("read linked Harnesses: %w", err)
-			}
-			if statusHarness != "" {
-				filtered := linked[:0]
+				registry := harness.NewRegistry(root)
+				linked, err := registry.List()
+				if err != nil {
+					return outcome{}, fmt.Errorf("read linked Harnesses: %w", err)
+				}
+				found := false
 				for _, candidate := range linked {
-					if candidate.ID == statusHarness {
-						filtered = append(filtered, candidate)
+					if candidate.ID == pos[0] {
+						found = true
+						break
 					}
 				}
-				if len(filtered) == 0 {
-					return fmt.Errorf("linked Harness %q was not found", statusHarness)
+				if !found {
+					return outcome{}, fmt.Errorf("linked Harness %q was not found", pos[0])
 				}
-				linked = filtered
+				if !*unlinkDryRun {
+					if err := registry.Unlink(pos[0]); err != nil {
+						return outcome{}, fmt.Errorf("unlink Harness: %w", err)
+					}
+				}
+				return outcome{command: "harness unlink", state: mutationState(*unlinkDryRun), result: map[string]any{"unlinked": pos[0]}}, nil
 			}
-			projections, err := registry.ListProjections()
-			if err != nil {
-				return fmt.Errorf("read Projections: %w", err)
-			}
-
-			harnessesResult := map[string]any{}
-			problems := []map[string]any{}
-			driftCount, missingCount, staleCount, unownedCount := 0, 0, 0, 0
-
-			showManaged := !statusUnowned
-			showUnowned := statusUnowned || statusAll
-			for _, candidate := range linked {
-				harnessResult := map[string]any{
-					"name":        candidate.Name,
-					"projections": map[string]any{},
-					"skills_path": candidate.SkillsPath,
+		}),
+		"status": command("Show linked Harness Projections, Drift, and Unowned paths.", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby harness status")
+			statusHarness := set.String("harness", "", "filter by linked Harness installation ID")
+			statusManaged := set.Bool("managed", false, "deprecated: managed status is the default")
+			statusUnowned := set.Bool("unowned", false, "report only Unowned paths")
+			statusAll := set.Bool("all", false, "include managed Projections, Drift, and Unowned paths")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				if *statusUnowned && (*statusManaged || *statusAll) {
+					return outcome{}, domainErrorf("--unowned cannot be combined with --managed or --all")
 				}
-				harnessesResult[candidate.ID] = harnessResult
-				projectionResult := harnessResult["projections"].(map[string]any)
-				owned := map[string]struct{}{}
-				for _, projection := range projections {
-					if projection.HarnessID != candidate.ID {
-						continue
+				root, err := brigsbyHome()
+				if err != nil {
+					return outcome{}, err
+				}
+				registry := harness.NewRegistry(root)
+				linked, err := registry.List()
+				if err != nil {
+					return outcome{}, fmt.Errorf("read linked Harnesses: %w", err)
+				}
+				if *statusHarness != "" {
+					filtered := linked[:0]
+					for _, candidate := range linked {
+						if candidate.ID == *statusHarness {
+							filtered = append(filtered, candidate)
+						}
 					}
-					owned[projection.Path] = struct{}{}
-					if !showManaged {
-						continue
+					if len(filtered) == 0 {
+						return outcome{}, fmt.Errorf("linked Harness %q was not found", *statusHarness)
 					}
-					missing, err := projectionMissing(projection.Path)
-					if err != nil {
-						return projectionStateErrorf("inspect projected %s: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
-					}
-					matches := false
-					if !missing {
-						matches, err = projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+					linked = filtered
+				}
+				projections, err := registry.ListProjections()
+				if err != nil {
+					return outcome{}, fmt.Errorf("read Projections: %w", err)
+				}
+
+				harnessesResult := map[string]any{}
+				problems := []map[string]any{}
+				driftCount, missingCount, staleCount, unownedCount := 0, 0, 0, 0
+				showManaged := !*statusUnowned
+				showUnowned := *statusUnowned || *statusAll
+
+				for _, candidate := range linked {
+					harnessResult := map[string]any{"name": candidate.Name, "skills_path": candidate.SkillsPath, "projections": map[string]any{}}
+					harnessesResult[candidate.ID] = harnessResult
+					projectionResult := harnessResult["projections"].(map[string]any)
+					owned := map[string]struct{}{}
+					for _, projection := range projections {
+						if projection.HarnessID != candidate.ID {
+							continue
+						}
+						owned[projection.Path] = struct{}{}
+						if !showManaged {
+							continue
+						}
+						missing, err := projectionMissing(projection.Path)
 						if err != nil {
-							return projectionStateErrorf("fingerprint projected %s: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
+							return outcome{}, fmt.Errorf("inspect projected %s: %w", projection.Path, err)
 						}
-					}
-					selected, _, err := artifact.NewStore(root).SelectedContentFilesPath(projection.Artifact)
-					if err != nil {
-						return projectionStateErrorf("canonical %s is unavailable: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
-					}
-					projectionKey := projectionStatusKey(projection.Artifact)
-					entry := map[string]any{
-						"revision": projection.Revision,
-						"path":     projection.Path,
-					}
-					switch {
-					case missing:
-						missingCount++
-						entry["status"] = "missing"
-						problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
-						problem["remedy"] = projectionRemedy(projection, candidate.ID)
-						entry["problem"] = problem
-						problems = append(problems, problem)
-					case matches && selected.Digest == projection.Revision:
-						entry["status"] = "projected"
-					case matches:
-						staleCount++
-						entry["status"] = "stale"
-						message := fmt.Sprintf("Projected %s in %s at %s is stale but unchanged.", displayContent(projection.Artifact), candidate.ID, projection.Path)
-						problem := projectionProblem(fmt.Sprintf("stale-%02d", staleCount), "projection_stale", message, candidate.ID, projection)
-						if artifact.KeyKind(projection.Artifact) == artifact.KindSkill {
+						matches := false
+						if !missing {
+							matches, err = projectionFingerprintMatches(projection.Path, projection.Fingerprint)
+							if err != nil {
+								return outcome{}, fmt.Errorf("fingerprint Projection: %w", err)
+							}
+						}
+						selected, _, err := artifact.NewStore(root).SelectedContentFilesPath(projection.Artifact)
+						if err != nil {
+							return outcome{}, projectionStateErrorf("canonical %s is unavailable: %w", candidate.ID, projection, displayContent(projection.Artifact), err)
+						}
+						entry := map[string]any{
+							"revision": projection.Revision,
+							"path":     projection.Path,
+						}
+						switch {
+						case missing:
+							missingCount++
+							entry["status"] = "missing"
+							problem := projectionProblem(fmt.Sprintf("missing-%02d", missingCount), "projection_missing", fmt.Sprintf("Projected %s is missing from %s at %s.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
 							problem["remedy"] = projectionRemedy(projection, candidate.ID)
-						} else {
-							problem["message"] = message + " Protected instruction files need review before a force sync."
+							entry["problem"] = problem
+							problems = append(problems, problem)
+						case matches && selected.Digest == projection.Revision:
+							entry["status"] = "projected"
+						case err == nil && matches:
+							staleCount++
+							entry["status"] = "stale"
+							problem := projectionProblem(fmt.Sprintf("stale-%02d", staleCount), "projection_stale", fmt.Sprintf("Projected %s in %s at %s is stale but unchanged.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
+							if artifact.KeyKind(projection.Artifact) == artifact.KindSkill {
+								problem["remedy"] = projectionRemedy(projection, candidate.ID)
+							} else {
+								problem["message"] = fmt.Sprintf("Projected %s in %s at %s is stale but unchanged. Protected instruction files need review before a force sync.", displayContent(projection.Artifact), candidate.ID, projection.Path)
+							}
+							entry["problem"] = problem
+							problems = append(problems, problem)
+						default:
+							driftCount++
+							entry["status"] = "drift"
+							problem := projectionProblem(fmt.Sprintf("drift-%02d", driftCount), "projection_drift", fmt.Sprintf("Projected %s in %s at %s differs from its recorded content. Inspect it before replacing it.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
+							entry["problem"] = problem
+							problems = append(problems, problem)
 						}
-						entry["problem"] = problem
+						projectionResult[projectionStatusKey(projection.Artifact)] = entry
+					}
+					if !showUnowned {
+						continue
+					}
+					unowned, err := unownedSkills(candidate.SkillsPath, owned)
+					if err != nil {
+						return outcome{}, err
+					}
+					unownedResult := map[string]any{}
+					for _, path := range unowned {
+						unownedCount++
+						problem := map[string]any{
+							"id":      fmt.Sprintf("unowned-%02d", unownedCount),
+							"code":    "unowned_path",
+							"harness": candidate.ID,
+							"kind":    "skill",
+							"path":    path,
+							"message": fmt.Sprintf("Skill path %s in %s is not managed by Brigsby.", path, candidate.ID),
+						}
+						unownedResult[path] = problem
 						problems = append(problems, problem)
-					default:
-						driftCount++
-						entry["status"] = "drift"
-						problem := projectionProblem(fmt.Sprintf("drift-%02d", driftCount), "projection_drift", fmt.Sprintf("Projected %s in %s at %s differs from its recorded content. Inspect it before replacing it.", displayContent(projection.Artifact), candidate.ID, projection.Path), candidate.ID, projection)
-						entry["problem"] = problem
-						problems = append(problems, problem)
 					}
-					projectionResult[projectionKey] = entry
-				}
-				if !showUnowned {
-					continue
-				}
-				unowned, err := unownedSkills(candidate.SkillsPath, owned)
-				if err != nil {
-					return err
-				}
-				unownedResult := map[string]any{}
-				for _, path := range unowned {
-					unownedCount++
-					problem := map[string]any{
-						"id":      fmt.Sprintf("unowned-%02d", unownedCount),
-						"code":    "unowned_path",
-						"harness": candidate.ID,
-						"kind":    "skill",
-						"message": fmt.Sprintf("Skill path %s in %s is not managed by Brigsby.", path, candidate.ID),
-						"path":    path,
+					if len(unownedResult) > 0 {
+						harnessResult["unowned"] = unownedResult
 					}
-					unownedResult[path] = problem
-					problems = append(problems, problem)
 				}
-				if len(unownedResult) > 0 {
-					harnessResult["unowned"] = unownedResult
-				}
-			}
 
-			state := "clean"
-			switch {
-			case driftCount > 0:
-				state = "drifted"
-			case missingCount > 0:
-				state = "missing"
-			case staleCount > 0:
-				state = "stale"
-			case unownedCount > 0:
-				state = "unowned"
-			}
-			return emitEnvelope(command.OutOrStdout(), state, problems, map[string]any{
-				"harnesses": harnessesResult,
-			})
-		},
-	}
-	status.Flags().StringVar(&statusHarness, "harness", "", "filter by linked Harness installation ID")
-	status.Flags().BoolVar(&statusManaged, "managed", false, "deprecated: managed status is the default")
-	status.Flags().BoolVar(&statusUnowned, "unowned", false, "report only Unowned paths")
-	status.Flags().BoolVar(&statusAll, "all", false, "include managed Projections, Drift, and Unowned paths")
-	_ = status.Flags().MarkHidden("managed")
-	harnessCommand.AddCommand(status)
-	return harnessCommand
-}
-
-func newSyncCommand() *cobra.Command {
-	var linkedIDs, skillRefs, instructionRefs []string
-	var force, dryRun bool
-	sync := &cobra.Command{
-		Use:   "sync",
-		Short: "Safely project selected canonical content to linked Harnesses.",
-		Long:  "Safely project selected canonical content to linked Harnesses. Select with --skill namespace/name and --instruction namespace/name; with neither, every selection in main is projected.",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, arguments []string) error {
-			root, err := brigsbyHome()
-			if err != nil {
-				return err
-			}
-			registry := harness.NewRegistry(root)
-			linked, err := registry.List()
-			if err != nil {
-				return fmt.Errorf("read linked Harnesses: %w", err)
-			}
-			var selectors []string
-			for _, group := range []struct {
-				kind string
-				refs []string
-			}{{artifact.KindSkill, skillRefs}, {artifact.KindInstruction, instructionRefs}} {
-				for _, ref := range group.refs {
-					key, err := artifact.Key(group.kind, ref)
-					if err != nil {
-						return asDomainError(err)
-					}
-					selectors = append(selectors, key)
+				state := "clean"
+				switch {
+				case driftCount > 0:
+					state = "drifted"
+				case missingCount > 0:
+					state = "missing"
+				case staleCount > 0:
+					state = "stale"
+				case unownedCount > 0:
+					state = "unowned"
 				}
+				return outcome{
+					command:  "harness status",
+					state:    state,
+					problems: problems,
+					result:   map[string]any{"harnesses": harnessesResult},
+				}, nil
 			}
-			targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, force)
-			if err != nil {
-				return err
-			}
-			defer cleanupSyncTargets(targets)
-			if dryRun {
-				return writeSyncResults(command, "planned", targets, nil)
-			}
-			var operations []recovery.Operation
-			for _, target := range targets {
-				if target.removal {
-					operation, err := recovery.New(root).Apply(target.plan)
-					if err != nil {
-						return partialSyncError(operations, target, err)
-					}
-					operations = append(operations, operation)
-					if err := registry.ForgetProjection(target.path); err != nil {
-						return partialSyncError(operations, target, fmt.Errorf("forget migrated Projection: %w", err))
-					}
-					continue
-				}
-				if target.plan.TargetFingerprint() != target.plan.ReplacementFingerprint() {
-					operation, err := recovery.New(root).Apply(target.plan)
-					if err != nil {
-						return partialSyncError(operations, target, err)
-					}
-					operations = append(operations, operation)
-				}
-				contentFingerprint, err := recovery.ContentFingerprint(target.path)
+		}),
+		"sync": command("Safely project selected canonical content to linked Harnesses. Select with --skill namespace/name and --instruction namespace/name; with neither, every selection in main is projected.", "", 0, 0, func() (*pflag.FlagSet, leaf) {
+			set := newFlagSet("brigsby harness sync")
+			var linkedIDs, skillRefs, instructionRefs []string
+			set.StringArrayVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
+			set.StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
+			set.StringArrayVar(&instructionRefs, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
+			force := set.Bool("force", false, "replace a single narrowed target that differs from canonical content")
+			dryRun := set.Bool("dry-run", false, "preview without writing")
+			return set, func(path string, pos []string, stderr io.Writer) (outcome, error) {
+				root, err := brigsbyHome()
 				if err != nil {
-					return partialSyncError(operations, target, fmt.Errorf("fingerprint projected content: %w", err))
+					return outcome{}, err
 				}
-				if err := registry.RecordProjection(harness.Projection{HarnessID: target.harness.ID, Path: target.path, Artifact: target.revision.Selector, Revision: target.revision.Digest, Fingerprint: contentFingerprint}); err != nil {
-					return partialSyncError(operations, target, fmt.Errorf("record Projection: %w", err))
+				registry := harness.NewRegistry(root)
+				linked, err := registry.List()
+				if err != nil {
+					return outcome{}, fmt.Errorf("read linked Harnesses: %w", err)
 				}
+				var selectors []string
+				for _, grp := range []struct {
+					kind string
+					refs []string
+				}{{artifact.KindSkill, skillRefs}, {artifact.KindInstruction, instructionRefs}} {
+					for _, ref := range grp.refs {
+						key, err := artifact.Key(grp.kind, ref)
+						if err != nil {
+							return outcome{}, asDomainError(err)
+						}
+						selectors = append(selectors, key)
+					}
+				}
+				targets, err := preflightSync(root, registry, linked, linkedIDs, selectors, *force)
+				if err != nil {
+					return outcome{}, err
+				}
+				defer cleanupSyncTargets(targets)
+				if *dryRun {
+					return syncOutcome("planned", targets, nil), nil
+				}
+				var operations []recovery.Operation
+				for _, target := range targets {
+					if target.removal {
+						operation, err := recovery.New(root).Apply(target.plan)
+						if err != nil {
+							return outcome{}, partialSyncError(operations, target, err)
+						}
+						operations = append(operations, operation)
+						if err := registry.ForgetProjection(target.path); err != nil {
+							return outcome{}, partialSyncError(operations, target, fmt.Errorf("forget migrated Projection: %w", err))
+						}
+						continue
+					}
+					if target.plan.TargetFingerprint() != target.plan.ReplacementFingerprint() {
+						operation, err := recovery.New(root).Apply(target.plan)
+						if err != nil {
+							return outcome{}, partialSyncError(operations, target, err)
+						}
+						operations = append(operations, operation)
+					}
+					contentFingerprint, err := recovery.ContentFingerprint(target.path)
+					if err != nil {
+						return outcome{}, partialSyncError(operations, target, fmt.Errorf("fingerprint projected content: %w", err))
+					}
+					if err := registry.RecordProjection(harness.Projection{HarnessID: target.harness.ID, Path: target.path, Artifact: target.revision.Selector, Revision: target.revision.Digest, Fingerprint: contentFingerprint}); err != nil {
+						return outcome{}, partialSyncError(operations, target, fmt.Errorf("record Projection: %w", err))
+					}
+				}
+				if len(operations) == 0 {
+					return syncOutcome("clean", targets, nil), nil
+				}
+				return syncOutcome("applied", targets, operations), nil
 			}
-			if len(operations) == 0 {
-				return writeSyncResults(command, "clean", targets, nil)
-			}
-			return writeSyncResults(command, "applied", targets, operations)
-		},
-	}
-	sync.Flags().StringArrayVar(&linkedIDs, "harness", nil, "linked Harness installation ID (repeatable)")
-	sync.Flags().StringArrayVar(&skillRefs, "skill", nil, "selected Skill reference namespace/name (repeatable)")
-	sync.Flags().StringArrayVar(&instructionRefs, "instruction", nil, "selected Instruction reference namespace/name (repeatable)")
-	sync.Flags().BoolVar(&force, "force", false, "replace a single narrowed target that differs from canonical content")
-	sync.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
-	return sync
+		}),
+	})
 }
 
 type syncTarget struct {
@@ -1822,48 +2143,6 @@ func projectionFingerprintMatches(path, expected string) (bool, error) {
 	return exact == expected, nil
 }
 
-func projectionMissing(path string) (bool, error) {
-	_, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return true, nil
-	}
-	return false, err
-}
-
-func projectionProblem(id, code, message, harnessID string, projection harness.Projection) map[string]any {
-	problem := projectionProblemFields(harnessID, projection)
-	problem["code"] = code
-	problem["id"] = id
-	problem["message"] = message
-	return problem
-}
-
-func projectionProblemFields(harnessID string, projection harness.Projection) map[string]any {
-	return map[string]any{
-		"harness": harnessID,
-		"kind":    kindWord(projection.Artifact),
-		"path":    projection.Path,
-		"ref":     artifact.DisplayRef(projection.Artifact),
-	}
-}
-
-// projectionRemedy returns a POSIX-shell command for an action the caller may
-// copy, paste, or run with a shell tool. It deliberately does not claim to be
-// an argv contract for direct process execution.
-type remedy struct {
-	Command string `json:"command"`
-}
-
-func projectionRemedy(projection harness.Projection, harnessID string) remedy {
-	flag := "--skill"
-	if artifact.KeyKind(projection.Artifact) == artifact.KindInstruction {
-		flag = "--instruction"
-	}
-	return remedy{
-		Command: fmt.Sprintf("brigsby sync %s %s --harness %s", flag, artifact.DisplayRef(projection.Artifact), harnessID),
-	}
-}
-
 func projectionFor(projections []harness.Projection, harnessID, path string) (harness.Projection, bool) {
 	for _, projection := range projections {
 		if projection.HarnessID == harnessID && projection.Path == path {
@@ -1945,7 +2224,9 @@ func partialSyncError(operations []recovery.Operation, target syncTarget, cause 
 	return fmt.Errorf("PARTIAL: sync stopped at %s after Recovery operations %s; no automatic rollback was attempted; restore explicitly with 'brigsby recovery restore <id>': %w", target.path, strings.Join(ids, ", "), cause)
 }
 
-func writeSyncResults(command *cobra.Command, state string, targets []syncTarget, operations []recovery.Operation) error {
+// syncOutcome renders the sync result envelope: one entry per projected or
+// migrated target, with the applied Recovery operation IDs in preview.
+func syncOutcome(state string, targets []syncTarget, operations []recovery.Operation) outcome {
 	results := make([]map[string]any, 0, len(targets))
 	for _, target := range targets {
 		operation := "project"
@@ -1961,19 +2242,13 @@ func writeSyncResults(command *cobra.Command, state string, targets []syncTarget
 			"operation": operation,
 		})
 	}
-	problems := []any{}
-	if state == "applied" {
-		problems = append(problems, recoveryGCProblems()...)
+	return outcome{
+		command:  "harness sync",
+		state:    state,
+		problems: []any{},
+		result:   results,
+		preview:  map[string]any{"recovery_ids": recoveryOperationIDs(operations)},
 	}
-	envelope := map[string]any{
-		"state":    state,
-		"problems": problems,
-		"result":   results,
-	}
-	if len(operations) > 0 {
-		envelope["recovery_ids"] = recoveryOperationIDs(operations)
-	}
-	return encodeCanonicalJSON(command.OutOrStdout(), envelope)
 }
 
 func recoveryOperationIDs(operations []recovery.Operation) []string {
@@ -1982,47 +2257,6 @@ func recoveryOperationIDs(operations []recovery.Operation) []string {
 		ids[index] = operation.ID
 	}
 	return ids
-}
-
-func mustBeMissing(path string) bool {
-	_, err := os.Lstat(path)
-	return os.IsNotExist(err)
-}
-
-func projectionPaths(projections []harness.Projection) []string {
-	paths := make([]string, len(projections))
-	for index, projection := range projections {
-		paths[index] = projection.Path
-	}
-	return paths
-}
-
-func lifecycleTargets(projections []harness.Projection) []lifecycle.Target {
-	targets := make([]lifecycle.Target, len(projections))
-	for index, projection := range projections {
-		targets[index] = lifecycle.Target{Path: projection.Path}
-	}
-	return targets
-}
-
-func mustArtifactPath(store artifact.Store, key string) string {
-	path, _ := store.ArtifactPath(key)
-	return path
-}
-
-func lifecyclePartialError(batch lifecycle.Batch, cause error) error {
-	if batch.ID == "" {
-		return cause
-	}
-	return partialError{batchID: batch.ID, err: cause}
-}
-
-func removeWithRecovery(root, path string) (recovery.Operation, error) {
-	plan, err := recovery.PlanRemoval(path)
-	if err != nil {
-		return recovery.Operation{}, err
-	}
-	return recovery.New(root).Apply(plan)
 }
 
 func unownedSkills(skillsPath string, owned map[string]struct{}) ([]string, error) {
@@ -2112,7 +2346,7 @@ func hasSkillFile(directory string) bool {
 // Projection, so `status` will not report drift against it. `add` copies into
 // canonical state; it never claims the source path. The advisory goes to
 // stderr so it never enters stdout or JSON output.
-func noteUntrackedSources(command *cobra.Command, root string, captured []artifact.Revision, sources []string) {
+func noteUntrackedSources(stderr io.Writer, root string, captured []artifact.Revision, sources []string) {
 	if len(captured) != len(sources) {
 		return
 	}
@@ -2141,7 +2375,7 @@ func noteUntrackedSources(command *cobra.Command, root string, captured []artifa
 			if filepath.Dir(absSource) != filepath.Clean(candidate.SkillsPath) {
 				continue
 			}
-			fmt.Fprintf(command.ErrOrStderr(),
+			fmt.Fprintf(stderr,
 				"NOTE %s sits in the %s Harness skills path but is not drift-tracked; run 'brigsby sync --skill %s --harness %s' to project and track it\n",
 				absSource, candidate.Name, artifact.DisplayRef(captured[index].Selector), candidate.ID)
 			break

@@ -452,6 +452,17 @@ func (s Store) SelectedContentFilesPath(selector string) (Revision, string, erro
 	return s.SelectedFilesPath(selector)
 }
 
+// RevisionContentFilesPath verifies and returns the immutable runtime tree for
+// an explicitly selected stored Revision without changing canonical selection.
+func (s Store) RevisionContentFilesPath(selector, digest string) (Revision, string, error) {
+	revision, err := s.VerifyRevision(selector, digest)
+	if err != nil {
+		return Revision{}, "", err
+	}
+	parts := strings.Split(selector, "/")
+	return revision, filepath.Join(s.artifactDir(parts[0], parts[1], parts[2]), "revisions", digest, "files"), nil
+}
+
 // RenderSelectedInstructions produces a native root plus a complete copied
 // document tree for one Harness without altering canonical bytes.
 func (s Store) RenderSelectedInstructions(selector, harnessName string) (RenderedInstructions, error) {
