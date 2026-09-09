@@ -40,7 +40,7 @@ jobs:
             -o "dist/${stage}/brigsby" ./cmd/brigsby
           cp LICENSE README.md "dist/${stage}/"
           tar -C "dist/${stage}" -czf "dist/${stage}.tar.gz" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: brigsby_${{ matrix.goos }}_${{ matrix.goarch }}
           path: dist/brigsby_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
