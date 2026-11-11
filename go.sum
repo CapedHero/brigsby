@@ -1,7 +1,7 @@
-github.com/itchyny/gojq v0.12.18 h1:gFGHyt/MLbG9n6dqnvlliiya2TaMMh6FFaR2b1H6Drc=
-github.com/itchyny/gojq v0.12.18/go.mod h1:4hPoZ/3lN9fDL1D+aK7DY1f39XZpY9+1Xpjz8atrEkg=
-github.com/itchyny/timefmt-go v0.1.7 h1:xyftit9Tbw+Dc/huSSPJaEmX1TVL8lw5vxjJLK4GMMA=
-github.com/itchyny/timefmt-go v0.1.7/go.mod h1:5E46Q+zj7vbTgWY8o5YkMeYb4I6GeWLFnetPy5oBrAI=
+github.com/itchyny/gojq v0.12.20 h1:mvxzKjEJDfeLlPc/15q5Kf6wLtEW2T399BL8xmOd9EQ=
+github.com/itchyny/gojq v0.12.20/go.mod h1:cgT47OXUC/BWCBh9V4LuuTRSwFIJNR5loUyqlzbIJbw=
+github.com/itchyny/timefmt-go v0.1.9 h1:J4j1qMqZbg5jycwT6zIKfRgZ9aqqMxqanaI6Rr9Ezs8=
+github.com/itchyny/timefmt-go v0.1.9/go.mod h1:5E46Q+zj7vbTgWY8o5YkMeYb4I6GeWLFnetPy5oBrAI=
 github.com/pelletier/go-toml/v2 v2.4.3 h1:GTRvJQutkOSftxIFD5xw9aepkYNuPWmVJpffdDPYVpY=
 github.com/pelletier/go-toml/v2 v2.4.3/go.mod h1:2gIqNv+qfxSVS7cM2xJQKtLSTLUE9V8t9Stt+h56mCY=
 github.com/spf13/pflag v1.0.9 h1:9exaQaMOCwffKiiiYk6/BndUBv+iRViNW+4lEMi0PvY=
